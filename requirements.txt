@@ -1,0 +1,5 @@
+PyQt6>=6.4.0
+pyrekordbox>=0.3.0
+mutagen>=1.47.0
+sqlcipher3-wheels
+sqlalchemy>=2.0.0
