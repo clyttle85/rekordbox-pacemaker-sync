@@ -200,11 +200,13 @@ class RepairDeviceDbDialog(QDialog):
 
         if device_db:
             self._db_edit.setText(device_db)
+            # Default scan root to the device root so we find files in any
+            # folder structure the Pacemaker Editor may have created.
             drive = os.path.splitdrive(device_db)[0]
-            music_root = os.path.join(drive, os.sep, "Music")
-            if os.path.isdir(music_root):
-                self._scan_root = music_root
-                self._scan_edit.setText(music_root)
+            device_root = drive + os.sep
+            if os.path.isdir(device_root):
+                self._scan_root = device_root
+                self._scan_edit.setText(device_root)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -269,10 +271,10 @@ class RepairDeviceDbDialog(QDialog):
         self._device_db = path
         self._db_edit.setText(path)
         drive = os.path.splitdrive(path)[0]
-        music_root = os.path.join(drive, os.sep, "Music")
-        if os.path.isdir(music_root) and not self._scan_edit.text():
-            self._scan_root = music_root
-            self._scan_edit.setText(music_root)
+        device_root = drive + os.sep
+        if os.path.isdir(device_root) and not self._scan_edit.text():
+            self._scan_root = device_root
+            self._scan_edit.setText(device_root)
 
     def _browse_scan(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Music Folder on Device")
@@ -290,6 +292,11 @@ class RepairDeviceDbDialog(QDialog):
 
         self._result_label.setText("Scanning…")
         QApplication.processEvents()
+
+        # The device drive letter (e.g. "J:"). A stored path is only valid if
+        # it starts with this drive — anything else is a PC path and is broken
+        # even if the file happens to exist on the PC.
+        device_drive = os.path.splitdrive(self._device_db)[0].upper()  # e.g. "J:"
 
         # Index every audio file on the device by lowercase filename
         file_index: dict[str, str] = {}
@@ -319,8 +326,13 @@ class RepairDeviceDbDialog(QDialog):
 
         for row in rows:
             loc = row["location"] or ""
-            if loc and os.path.exists(loc):
-                continue  # path is valid — skip
+            # A path is only valid if it lives on the device drive AND exists.
+            # PC paths (e.g. C:\Users\...) must be treated as broken even if
+            # the file exists on the PC — the Pacemaker firmware can't read them.
+            loc_drive = os.path.splitdrive(loc)[0].upper() if loc else ""
+            if loc and loc_drive == device_drive and os.path.exists(loc):
+                continue  # genuinely on the device and present — skip
+
             basename = os.path.basename(loc).lower() if loc else ""
             if basename and basename in file_index:
                 self._fixes.append({
@@ -346,6 +358,12 @@ class RepairDeviceDbDialog(QDialog):
                 f"  \u2022 {len(unmatched)} could not be matched "
                 f"(no audio file with that name found in the scan folder)"
             )
+        # Show a sample of what will be fixed so the user can verify the paths look right
+        if self._fixes:
+            sample = self._fixes[0]
+            lines.append(f"\nExample fix:")
+            lines.append(f"  From: {sample['old']}")
+            lines.append(f"  To:   {sample['new']}")
         self._result_label.setText("\n".join(lines))
         self._apply_btn.setEnabled(bool(self._fixes))
 
