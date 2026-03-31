@@ -122,12 +122,19 @@ class DevicePushWorker(QObject):
 
             with PacemakerWriter(self._device_db) as device:
                 device_case_map = {c["name"]: c["case_id"] for c in device.get_all_cases()}
+                stale_locations: set[str] = set()
 
                 for case in self._cases:
                     tracks = all_tracks[case["case_id"]]
 
                     if case["name"] in device_case_map:
                         device_case_id = device_case_map[case["name"]]
+                        # Collect old locations before clearing so we can
+                        # delete any orphaned track records (e.g. broken PC
+                        # paths) after all cases are written.
+                        stale_locations.update(
+                            device.get_case_track_locations(device_case_id)
+                        )
                         device.clear_case_tracks(device_case_id)
                     else:
                         device_case_id = device.create_case(case["name"])
@@ -154,6 +161,12 @@ class DevicePushWorker(QObject):
                         tid = device.insert_or_get_track(device_track)
                         device.link_track_to_case(device_case_id, tid)
                         done += 1
+
+                # Remove any track records that are no longer linked to a
+                # case — this cleans up the old broken-path records that
+                # were left behind by the previous push implementation.
+                if stale_locations:
+                    device.delete_orphan_tracks(list(stale_locations))
 
             msg = f"Pushed {len(self._cases)} case(s) to device ({done - skipped} tracks copied)."
             if skipped:
