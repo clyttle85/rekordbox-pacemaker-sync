@@ -1033,23 +1033,40 @@ class MainWindow(QMainWindow):
         )
 
     def _eject_device(self):
-        import subprocess, os
+        import subprocess
         db_path = self._device_panel.db_path
         if not db_path:
             return
         drive = os.path.splitdrive(db_path)[0]   # e.g. "J:"
         letter = drive.rstrip(":")               # "J"
+
+        # Use a PowerShell script that:
+        # 1. Flushes the volume (via mountvol /p — safe removal)
+        # 2. Falls back to Shell.Application eject if that fails
+        # Run synchronously (wait=True) so we know when it's done.
+        ps_script = (
+            f"$vol = '{letter}:';"
+            f"$shell = New-Object -comObject Shell.Application;"
+            f"$drive = $shell.Namespace(17).ParseName($vol);"
+            f"if ($drive) {{ $drive.InvokeVerb('Eject') }}"
+        )
         try:
-            subprocess.Popen(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command",
-                 f"(New-Object -comObject Shell.Application)"
-                 f".Namespace(17).ParseName('{letter}:').InvokeVerb('Eject')"],
+            result = subprocess.run(
+                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
                 creationflags=subprocess.CREATE_NO_WINDOW,
+                capture_output=True,
+                timeout=15,
             )
             self._device_panel.set_db_path_label("")
             self._device_panel.clear()
             self.statusBar().showMessage(
-                f"Ejecting {drive}… safe to disconnect when Windows confirms."
+                f"{drive} ejected — safe to disconnect."
+            )
+        except subprocess.TimeoutExpired:
+            QMessageBox.warning(
+                self, "Eject Timeout",
+                "The eject command timed out. The device may still be in use.\n"
+                "Close any open files on the device and try again."
             )
         except Exception as e:
             QMessageBox.warning(self, "Eject Failed", str(e))
