@@ -86,31 +86,52 @@ class DevicePushWorker(QObject):
         self._cases = cases   # [{"case_id": int, "name": str, "track_count": int, ...}, ...]
 
     @staticmethod
-    def _copy_track(src_path: str, music_root: str) -> str:
+    def _pmdb_location(src_path: str) -> str:
         """
-        Copy src_path into music_root and return the destination path.
-        Skips the copy if a file of the same name and size already exists.
-        Handles filename collisions by appending a hash-derived suffix.
+        Derive the device-side DB location string for a source file.
+        Format: /pmdb_tracks/X/Y/HHHHHHHH.ext
+        where HHHHHHHH = CRC32 of the source path (8 hex chars),
+        X = first hex char, Y = second hex char.
+        This matches the folder layout the Pacemaker firmware expects.
         """
-        os.makedirs(music_root, exist_ok=True)
-        filename = os.path.basename(src_path)
-        dest = os.path.join(music_root, filename)
+        import zlib
+        crc = f"{zlib.crc32(src_path.encode()) & 0xFFFFFFFF:08x}"
+        ext = os.path.splitext(src_path)[1].lower()
+        return f"/pmdb_tracks/{crc[0]}/{crc[1]}/{crc}{ext}"
 
-        if os.path.exists(dest):
-            if os.path.getsize(dest) == os.path.getsize(src_path):
-                return dest   # already there, same size — reuse
-            # Collision with a different file: add a short suffix
-            name, ext = os.path.splitext(filename)
-            dest = os.path.join(music_root, f"{name}_{abs(hash(src_path)) % 9999:04d}{ext}")
+    @staticmethod
+    def _copy_track(src_path: str, device_db: str) -> tuple[str, str]:
+        """
+        Copy src_path to the correct location under J:\\.Pacemaker\\Music\\X\\Y\\
+        and create the companion 0-byte .str file the firmware expects.
+        Returns (windows_dest_path, pmdb_location_string).
+        """
+        import zlib
+        device_drive = os.path.splitdrive(device_db)[0]   # e.g. "J:"
+        crc = f"{zlib.crc32(src_path.encode()) & 0xFFFFFFFF:08x}"
+        ext = os.path.splitext(src_path)[1].lower()
+        dir1, dir2 = crc[0], crc[1]
 
-        shutil.copy2(src_path, dest)
-        return dest
+        dest_dir = os.path.join(device_drive, os.sep, ".Pacemaker", "Music", dir1, dir2)
+        os.makedirs(dest_dir, exist_ok=True)
+
+        dest = os.path.join(dest_dir, f"{crc}{ext}")
+        pmdb_loc = f"/pmdb_tracks/{dir1}/{dir2}/{crc}{ext}"
+
+        # Skip copy if already there and same size
+        if not (os.path.exists(dest) and os.path.getsize(dest) == os.path.getsize(src_path)):
+            shutil.copy2(src_path, dest)
+
+        # Create companion 0-byte .str file (firmware requires this)
+        str_path = os.path.splitext(dest)[0] + ".str"
+        if not os.path.exists(str_path):
+            open(str_path, "wb").close()
+
+        return dest, pmdb_loc
 
     def run(self):
         try:
             total_tracks = sum(c.get("track_count", 0) for c in self._cases)
-            device_drive = os.path.splitdrive(self._device_db)[0]   # e.g. "J:"
-            music_root = os.path.join(device_drive, os.sep, "Music")
             skipped = 0
             done = 0
 
@@ -129,9 +150,6 @@ class DevicePushWorker(QObject):
 
                     if case["name"] in device_case_map:
                         device_case_id = device_case_map[case["name"]]
-                        # Collect old locations before clearing so we can
-                        # delete any orphaned track records (e.g. broken PC
-                        # paths) after all cases are written.
                         stale_locations.update(
                             device.get_case_track_locations(device_case_id)
                         )
@@ -151,20 +169,21 @@ class DevicePushWorker(QObject):
                             continue
 
                         try:
-                            dest = self._copy_track(track.location, music_root)
+                            _win_dest, pmdb_loc = self._copy_track(
+                                track.location, self._device_db
+                            )
                         except Exception:
                             skipped += 1
                             done += 1
                             continue
 
-                        device_track = dataclasses.replace(track, location=dest)
+                        # Store the Linux-style /pmdb_tracks/... path in the DB,
+                        # not the Windows path — this is what the firmware reads.
+                        device_track = dataclasses.replace(track, location=pmdb_loc)
                         tid = device.insert_or_get_track(device_track)
                         device.link_track_to_case(device_case_id, tid)
                         done += 1
 
-                # Remove any track records that are no longer linked to a
-                # case — this cleans up the old broken-path records that
-                # were left behind by the previous push implementation.
                 if stale_locations:
                     device.delete_orphan_tracks(list(stale_locations))
 
@@ -200,13 +219,18 @@ class RepairDeviceDbDialog(QDialog):
 
         if device_db:
             self._db_edit.setText(device_db)
-            # Default scan root to the device root so we find files in any
-            # folder structure the Pacemaker Editor may have created.
             drive = os.path.splitdrive(device_db)[0]
-            device_root = drive + os.sep
-            if os.path.isdir(device_root):
-                self._scan_root = device_root
-                self._scan_edit.setText(device_root)
+            # Music lives at J:\.Pacemaker\Music\ — default scan root there
+            music_root = os.path.join(drive, os.sep, ".Pacemaker", "Music")
+            if os.path.isdir(music_root):
+                self._scan_root = music_root
+                self._scan_edit.setText(music_root)
+            else:
+                # Fallback to device root
+                device_root = drive + os.sep
+                if os.path.isdir(device_root):
+                    self._scan_root = device_root
+                    self._scan_edit.setText(device_root)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -271,10 +295,10 @@ class RepairDeviceDbDialog(QDialog):
         self._device_db = path
         self._db_edit.setText(path)
         drive = os.path.splitdrive(path)[0]
-        device_root = drive + os.sep
-        if os.path.isdir(device_root) and not self._scan_edit.text():
-            self._scan_root = device_root
-            self._scan_edit.setText(device_root)
+        music_root = os.path.join(drive, os.sep, ".Pacemaker", "Music")
+        if os.path.isdir(music_root) and not self._scan_edit.text():
+            self._scan_root = music_root
+            self._scan_edit.setText(music_root)
 
     def _browse_scan(self):
         folder = QFileDialog.getExistingDirectory(self, "Select Music Folder on Device")
@@ -321,24 +345,45 @@ class RepairDeviceDbDialog(QDialog):
             self._result_label.setText("Scan failed.")
             return
 
+        device_drive = os.path.splitdrive(self._device_db)[0].upper()  # e.g. "J:"
+
+        def pmdb_to_windows(loc: str) -> str:
+            """Convert /pmdb_tracks/X/Y/hash.mp3 → J:\\.Pacemaker\\Music\\X\\Y\\hash.mp3"""
+            rel = loc.replace("/pmdb_tracks/", "").replace("/", os.sep)
+            return os.path.join(device_drive, os.sep, ".Pacemaker", "Music", rel)
+
+        def is_valid_device_path(loc: str) -> bool:
+            """A location is valid if it's a pmdb path and the file exists on the device."""
+            if not loc:
+                return False
+            if loc.startswith("/pmdb_tracks/"):
+                return os.path.exists(pmdb_to_windows(loc))
+            # Windows path on the device drive — legacy check
+            return os.path.splitdrive(loc)[0].upper() == device_drive and os.path.exists(loc)
+
         self._fixes = []
         unmatched = []
 
         for row in rows:
             loc = row["location"] or ""
-            # A path is only valid if it lives on the device drive AND exists.
-            # PC paths (e.g. C:\Users\...) must be treated as broken even if
-            # the file exists on the PC — the Pacemaker firmware can't read them.
-            loc_drive = os.path.splitdrive(loc)[0].upper() if loc else ""
-            if loc and loc_drive == device_drive and os.path.exists(loc):
-                continue  # genuinely on the device and present — skip
+            if is_valid_device_path(loc):
+                continue  # path resolves to a real file on the device — skip
 
             basename = os.path.basename(loc).lower() if loc else ""
             if basename and basename in file_index:
+                # Convert the Windows path we found back to a pmdb location string
+                win_path = file_index[basename]
+                # Try to express as /pmdb_tracks/... if it's inside .Pacemaker\Music
+                pacemaker_music = os.path.join(device_drive, os.sep, ".Pacemaker", "Music")
+                if win_path.startswith(pacemaker_music):
+                    rel = win_path[len(pacemaker_music):].lstrip(os.sep).replace(os.sep, "/")
+                    new_loc = f"/pmdb_tracks/{rel}"
+                else:
+                    new_loc = win_path  # fallback: store as-is
                 self._fixes.append({
                     "track_id": row["track_id"],
                     "old": loc,
-                    "new": file_index[basename],
+                    "new": new_loc,
                 })
             elif loc:
                 unmatched.append(loc)
