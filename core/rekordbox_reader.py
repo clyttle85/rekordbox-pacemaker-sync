@@ -126,6 +126,51 @@ class RekordboxReader:
 
         return node
 
+    def get_waveform_data(self, location: str) -> list[tuple[int, int]] | None:
+        """
+        Return 400 (height, color) tuples from the PWAV preview waveform for a track,
+        identified by its PC file path (FolderPath in Rekordbox).
+        height: 0-31, color: 0-7 (0=white/silent, 2=blue, 5=red, etc.)
+        Returns None if the track or ANLZ file cannot be found.
+        """
+        try:
+            from pyrekordbox import AnlzFile
+            import os as _os
+
+            # Exact match first
+            result = self._db.get_content(FolderPath=location)
+            content = result.one_or_none() if hasattr(result, "one_or_none") else result
+
+            # Case-insensitive fallback (Windows paths are case-insensitive;
+            # SQLite filter_by does an exact match so "C:\Users\Opera\..." won't
+            # match "C:\Users\opera\..." stored in the DB).
+            if content is None:
+                try:
+                    import sqlalchemy
+                    from pyrekordbox.db6.tables import DjmdContent
+                    content = self._db.query(DjmdContent).filter(
+                        sqlalchemy.func.lower(DjmdContent.FolderPath)
+                        == location.lower()
+                    ).first()
+                except Exception:
+                    pass
+
+            if content is None:
+                return None
+
+            dat_path = self._db.get_anlz_path(content, "DAT")
+            if not dat_path:
+                return None
+            if not _os.path.exists(str(dat_path)):
+                return None
+            anlz = AnlzFile.parse_file(str(dat_path))
+            pwav = anlz.get_tag("PWAV")
+            if pwav is None:
+                return None
+            return [(v & 0x1F, (v >> 5) & 0x7) for v in pwav.content.entries]
+        except Exception:
+            return None
+
     def get_playlist_tracks(self, playlist_id: str) -> list[TrackInfo]:
         """Return ordered list of TrackInfo for all tracks in a playlist."""
         import os
@@ -148,7 +193,8 @@ class RekordboxReader:
             bpm = 0
             if content.BPM is not None:
                 try:
-                    bpm = int(float(str(content.BPM)))
+                    # Rekordbox stores BPM as integer × 100 (e.g. 13601 = 136.01 BPM)
+                    bpm = round(int(content.BPM) / 100)
                 except (ValueError, TypeError):
                     bpm = 0
 

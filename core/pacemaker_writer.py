@@ -296,18 +296,50 @@ class PacemakerWriter:
 
     def get_all_cases(self) -> list[dict]:
         """
-        Return all cases in the database with their track counts.
-        Each entry: {"case_id": int, "name": str, "track_count": int}
+        Return all cases in the database with their track counts and total file size.
+        Each entry: {"case_id": int, "name": str, "track_count": int, "file_size_bytes": int}
         """
         cursor = self._conn.cursor()
         cursor.execute("""
-            SELECT c.case_id, c.name, COUNT(ct.track_id) AS track_count
+            SELECT c.case_id, c.name,
+                   COUNT(ct.track_id) AS track_count,
+                   COALESCE(SUM(t.file_size), 0) AS file_size_bytes
             FROM cases c
             LEFT JOIN casetracks ct ON ct.case_id = c.case_id
+            LEFT JOIN tracks t ON t.track_id = ct.track_id
             GROUP BY c.case_id, c.name
             ORDER BY c.name COLLATE NOCASE
         """)
         return [
-            {"case_id": row["case_id"], "name": row["name"], "track_count": row["track_count"]}
+            {
+                "case_id": row["case_id"],
+                "name": row["name"],
+                "track_count": row["track_count"],
+                "file_size_bytes": row["file_size_bytes"],
+            }
             for row in cursor.fetchall()
         ]
+
+    def fix_bpm_values(self) -> int:
+        """
+        One-time migration: divides by 100 any bpm/ind_bpm stored as BPM×100
+        (i.e. values > 1000, e.g. 14000 → 140).  Returns the number of rows fixed.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM tracks WHERE bpm > 1000")
+        count = cursor.fetchone()[0]
+        if count:
+            cursor.execute("""
+                UPDATE tracks SET
+                    bpm     = ROUND(CAST(bpm AS REAL) / 100),
+                    ind_bpm = ROUND(CAST(ind_bpm AS REAL) / 100)
+                WHERE bpm > 1000
+            """)
+            self._conn.commit()
+        return count
+
+    def get_total_track_bytes(self) -> int:
+        """Return the sum of file_size for all unique tracks in the database."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT COALESCE(SUM(file_size), 0) AS total FROM tracks")
+        return cursor.fetchone()["total"]

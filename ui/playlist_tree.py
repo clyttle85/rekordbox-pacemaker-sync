@@ -4,19 +4,49 @@ Left panel: Rekordbox playlist tree with checkboxes.
 - Folders are non-checkable; checking a folder checks all its children.
 - Previously synced playlists are pre-checked (loaded from sync state).
 - Emits a signal when the selection changes so the sync panel can update.
+- Rekordbox-inspired appearance: grey folder icons, white playlist text,
+  grey right-aligned track count column.
 """
 
 from __future__ import annotations
 import json
 from PyQt6.QtWidgets import QTreeWidget, QTreeWidgetItem, QHeaderView
-from PyQt6.QtCore import Qt, pyqtSignal, QSettings
-from PyQt6.QtGui import QFont
+from PyQt6.QtCore import Qt, pyqtSignal, QSettings, QSize
+from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QPainter, QPen, QBrush
 
 from core.rekordbox_reader import PlaylistNode
 
+_FOLDER_COLOR  = QColor("#777777")
+_PLAYLIST_COLOR = QColor("#d8d8d8")
+_COUNT_COLOR   = QColor("#555555")
 
-FOLDER_ICON = "📁"
-PLAYLIST_ICON = "♫"
+
+def _make_folder_icon() -> QIcon:
+    """Small grey folder icon — 16×13 px."""
+    pix = QPixmap(16, 13)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    p.setRenderHint(QPainter.RenderHint.Antialiasing)
+    col = QColor("#666666")
+    p.setPen(Qt.PenStyle.NoPen)
+    p.setBrush(QBrush(col))
+    p.drawRoundedRect(0, 3, 16, 10, 1, 1)   # body
+    p.drawRoundedRect(0, 1, 7, 5, 1, 1)     # tab
+    p.end()
+    return QIcon(pix)
+
+
+def _make_playlist_icon() -> QIcon:
+    """Three horizontal lines — playlist symbol, 16×13 px."""
+    pix = QPixmap(16, 13)
+    pix.fill(Qt.GlobalColor.transparent)
+    p = QPainter(pix)
+    pen = QPen(QColor("#777777"), 1.5)
+    p.setPen(pen)
+    for y in (3, 6, 9):
+        p.drawLine(1, y, 14, y)
+    p.end()
+    return QIcon(pix)
 
 
 class PlaylistTreeWidget(QTreeWidget):
@@ -24,14 +54,35 @@ class PlaylistTreeWidget(QTreeWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setHeaderLabel("Rekordbox Library")
-        self.header().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self._folder_icon   = _make_folder_icon()
+        self._playlist_icon = _make_playlist_icon()
+
+        self.setColumnCount(2)
+        header = self.header()
+        header.hide()
+        header.setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
+        header.setSectionResizeMode(1, QHeaderView.ResizeMode.Fixed)
+        self.setColumnWidth(0, 186)
+        self.setColumnWidth(1, 32)
+
         self.setAnimated(True)
+        self.setIconSize(QSize(14, 12))
         self._settings = QSettings("rekordbox-pacemaker-sync", "PlaylistTree")
         self._updating = False  # guard against recursive itemChanged signals
         self.itemChanged.connect(self._on_item_changed)
         self.itemExpanded.connect(self._on_item_expanded)
         self.itemCollapsed.connect(self._on_item_collapsed)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._fit_columns()
+
+    def _fit_columns(self) -> None:
+        """Keep column 0 filling the available width; column 1 stays fixed at 32px."""
+        count_w = 32
+        name_w = max(self.viewport().width() - count_w, 40)
+        self.setColumnWidth(0, name_w)
+        self.setColumnWidth(1, count_w)
 
     def load_tree(self, nodes: list[PlaylistNode], synced_ids: set[str]) -> None:
         """Populate the tree from a list of PlaylistNodes."""
@@ -44,36 +95,31 @@ class PlaylistTreeWidget(QTreeWidget):
         self._updating = False
 
     def _build_item(self, node: PlaylistNode, synced_ids: set[str]) -> QTreeWidgetItem:
-        if node.is_folder:
-            label = f"{FOLDER_ICON}  {node.name}"
-        else:
-            label = f"{PLAYLIST_ICON}  {node.name}  ({node.track_count})"
-
-        item = QTreeWidgetItem([label])
+        item = QTreeWidgetItem()
         item.setData(0, Qt.ItemDataRole.UserRole, node.id)
         item.setData(0, Qt.ItemDataRole.UserRole + 1, node.is_folder)
 
         if node.is_folder:
-            # Folders: not directly checkable via their own box,
-            # but we give them a tristate checkbox driven by children.
-            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsAutoTristate | Qt.ItemFlag.ItemIsUserCheckable)
-            item.setCheckState(0, Qt.CheckState.Unchecked)
+            item.setText(0, node.name)
+            item.setIcon(0, self._folder_icon)
+            item.setForeground(0, _FOLDER_COLOR)
             font = item.font(0)
             font.setBold(True)
             item.setFont(0, font)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsAutoTristate | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setCheckState(0, Qt.CheckState.Unchecked)
             for child_node in node.children:
-                child_item = self._build_item(child_node, synced_ids)
-                item.addChild(child_item)
+                item.addChild(self._build_item(child_node, synced_ids))
         else:
+            item.setText(0, node.name)
+            item.setText(1, str(node.track_count) if node.track_count else "")
+            item.setIcon(0, self._playlist_icon)
+            item.setForeground(0, _PLAYLIST_COLOR)
+            item.setForeground(1, _COUNT_COLOR)
+            item.setTextAlignment(1, Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
             item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
             checked = node.id in synced_ids
             item.setCheckState(0, Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked)
-
-            # Bold for previously synced items so they stand out
-            if checked:
-                font = item.font(0)
-                font.setBold(True)
-                item.setFont(0, font)
 
         return item
 
@@ -81,7 +127,6 @@ class PlaylistTreeWidget(QTreeWidget):
         if self._updating or column != 0:
             return
         self._updating = True
-        # If a folder is toggled, cascade to children
         is_folder = item.data(0, Qt.ItemDataRole.UserRole + 1)
         if is_folder:
             state = item.checkState(0)

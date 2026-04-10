@@ -14,6 +14,7 @@ Menu:
 
 from __future__ import annotations
 import dataclasses
+import json
 import os
 import re
 import shutil
@@ -21,12 +22,107 @@ from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QMessageBox,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QProgressDialog,
-    QApplication, QFrame, QInputDialog
+    QApplication, QFrame, QInputDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QStyledItemDelegate,
 )
-from PyQt6.QtCore import Qt, QThread, pyqtSignal, QObject
-from PyQt6.QtGui import QAction
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QUrl, QEvent
+from PyQt6.QtGui import QAction, QPainter, QColor, QBrush
+
+try:
+    from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
+    _PREVIEW_OK = True
+except ImportError:
+    _PREVIEW_OK = False
 
 from core.rekordbox_reader import RekordboxReader, PlaylistNode, TrackInfo
+
+_WAVE_COL_ROLE = Qt.ItemDataRole.UserRole + 3   # stores list[tuple[int,int]] waveform data
+
+# Color palette matching player_bar.py
+_WDELEGATE_COLORS = [
+    QColor("#555555"),  # 0 silent
+    QColor("#ff88aa"),  # 1 pink
+    QColor("#5599ff"),  # 2 blue
+    QColor("#88ccff"),  # 3 bright blue
+    QColor("#44ddcc"),  # 4 cyan
+    QColor("#e8631a"),  # 5 orange
+    QColor("#ffdd44"),  # 6 yellow
+    QColor("#44cc44"),  # 7 green
+]
+
+
+class _WaveformDelegate(QStyledItemDelegate):
+    """Draws a mini waveform preview inside a table cell.
+    When preview_row matches the row being painted, draws a stop-button overlay.
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.preview_row: int = -1   # row currently being previewed (-1 = none)
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        data = index.data(_WAVE_COL_ROLE)
+        is_preview = (index.row() == self.preview_row)
+
+        if not data:
+            painter.fillRect(option.rect, QColor("#181818"))
+            if is_preview:
+                self._draw_stop_icon(painter, option.rect)
+            else:
+                painter.setPen(QColor("#333333"))
+                mid_y = option.rect.center().y()
+                painter.drawLine(option.rect.left() + 2, mid_y,
+                                 option.rect.right() - 2, mid_y)
+            return
+
+        r = option.rect
+        painter.fillRect(r, QColor("#181818"))
+        n = len(data)
+        w = r.width()
+        h = r.height()
+        mid = r.top() + h / 2
+        max_h = h * 0.85 / 2
+        bar_w = max(w / n, 1.0)
+        painter.setPen(Qt.PenStyle.NoPen)
+        for i, (height, color_idx) in enumerate(data):
+            bar_h = max((height / 31.0) * max_h, 1.0)
+            x = r.left() + int(i * bar_w)
+            bw = max(int(bar_w), 1)
+            col = _WDELEGATE_COLORS[color_idx % len(_WDELEGATE_COLORS)]
+            painter.setBrush(QBrush(col))
+            painter.drawRect(x, int(mid - bar_h), bw, max(int(bar_h * 2), 1))
+
+        if is_preview:
+            self._draw_stop_icon(painter, r)
+
+    @staticmethod
+    def _draw_stop_icon(painter: QPainter, rect) -> None:
+        """Light dim overlay + white stop square pinned to the left edge."""
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QBrush(QColor(0, 0, 0, 80)))
+        painter.drawRect(rect)
+        # Stop square: left-aligned, vertically centred
+        painter.setBrush(QBrush(QColor("#ffffff")))
+        sq = 7
+        cx = rect.left() + 11   # 11 px from left edge
+        cy = rect.center().y()
+        painter.drawRect(cx - sq // 2, cy - sq // 2, sq, sq)
+
+    def sizeHint(self, option, index):
+        return option.rect.size()
+
+
+class _SortableItem(QTableWidgetItem):
+    """QTableWidgetItem that sorts by a numeric UserRole+1 value when set."""
+    _SORT_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def __lt__(self, other: "QTableWidgetItem") -> bool:
+        a = self.data(self._SORT_ROLE)
+        b = other.data(self._SORT_ROLE)
+        if a is not None and b is not None:
+            return a < b
+        return super().__lt__(other)
 from core.pacemaker_writer import PacemakerWriter
 from core import sync_state
 from core.device_finder import find_editor_db, find_device_db
@@ -34,6 +130,61 @@ from core.m3u8_reader import load_m3u8_tracks
 from ui.playlist_tree import PlaylistTreeWidget
 from ui.sync_panel import SyncPanel, SyncQueueItem
 from ui.pacemaker_panel import PacemakerLibraryPanel
+from ui.player_bar import PlayerBar
+
+
+# ---------------------------------------------------------------------------
+# Per-device sync map  (<drive>:\.Pacemaker\rb_sync_map.json)
+# Maps str(editor_case_id) → device_case_id so each device independently
+# tracks which Editor cases have been pushed to it.
+# ---------------------------------------------------------------------------
+
+def _sync_map_path(device_db: str) -> str:
+    drive = os.path.splitdrive(device_db)[0]
+    return os.path.join(drive, os.sep, ".Pacemaker", "rb_sync_map.json")
+
+
+def _read_sync_map(device_db: str) -> dict:
+    """Returns {str(editor_case_id): device_case_id}. Empty dict on any error."""
+    try:
+        with open(_sync_map_path(device_db), "r", encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _write_sync_map(device_db: str, sync_map: dict) -> None:
+    try:
+        with open(_sync_map_path(device_db), "w", encoding="utf-8") as f:
+            json.dump(sync_map, f, indent=2)
+    except Exception:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Background worker: batch waveform fetch for track table
+# ---------------------------------------------------------------------------
+
+class _WaveformBatchWorker(QObject):
+    row_done = pyqtSignal(int, object)   # (row_index, list[(height,color)] or None)
+    finished = pyqtSignal()
+
+    def __init__(self, rb_reader, locations: list[str]):
+        super().__init__()
+        self._reader = rb_reader
+        self._locations = locations
+        self._cancelled = False
+
+    def cancel(self) -> None:
+        self._cancelled = True
+
+    def run(self):
+        for i, loc in enumerate(self._locations):
+            if self._cancelled:
+                break
+            data = self._reader.get_waveform_data(loc) if self._reader else None
+            self.row_done.emit(i, data)
+        self.finished.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -72,18 +223,21 @@ class SyncWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
-# Background worker: Editor → Device push
+# Background worker: Editor → Device sync (add new + remove unchecked)
 # ---------------------------------------------------------------------------
 
-class DevicePushWorker(QObject):
+class DeviceSyncWorker(QObject):
     progress = pyqtSignal(int, int, str)   # current, total, status message
     finished = pyqtSignal(bool, str)
 
-    def __init__(self, editor_db: str, device_db: str, cases: list):
+    def __init__(self, editor_db: str, device_db: str,
+                 to_add: list, to_remove: list, sync_map: dict):
         super().__init__()
         self._editor_db = editor_db
         self._device_db = device_db
-        self._cases = cases   # [{"case_id": int, "name": str, "track_count": int, ...}, ...]
+        self._to_add = to_add        # [{"case_id", "name", "track_count"}]
+        self._to_remove = to_remove  # [{"editor_case_id", "device_case_id", "name"}]
+        self._sync_map = dict(sync_map)  # working copy; written to device on completion
 
     @staticmethod
     def _pmdb_location(src_path: str) -> str:
@@ -131,66 +285,74 @@ class DevicePushWorker(QObject):
 
     def run(self):
         try:
-            total_tracks = sum(c.get("track_count", 0) for c in self._cases)
-            skipped = 0
+            removed = 0
             done = 0
+            skipped = 0
 
-            with PacemakerWriter(self._editor_db) as editor:
-                all_tracks = {
-                    case["case_id"]: editor.get_case_tracks_as_trackinfo(case["case_id"])
-                    for case in self._cases
-                }
+            # ── Phase 1: Remove unchecked cases from device ──────────────
+            if self._to_remove:
+                with PacemakerWriter(self._device_db) as device:
+                    for r in self._to_remove:
+                        self.progress.emit(0, 1, f"Removing: {r['name']}")
+                        locs = device.get_case_track_locations(r["device_case_id"])
+                        device.remove_playlist(r["device_case_id"], list(locs))
+                        self._sync_map.pop(str(r["editor_case_id"]), None)
+                        removed += 1
 
-            with PacemakerWriter(self._device_db) as device:
-                device_case_map = {c["name"]: c["case_id"] for c in device.get_all_cases()}
-                stale_locations: set[str] = set()
+            # ── Phase 2: Push new checked cases to device ─────────────────
+            total_tracks = sum(c.get("track_count", 0) for c in self._to_add)
 
-                for case in self._cases:
-                    tracks = all_tracks[case["case_id"]]
+            if self._to_add:
+                with PacemakerWriter(self._editor_db) as editor:
+                    all_tracks = {
+                        c["case_id"]: editor.get_case_tracks_as_trackinfo(c["case_id"])
+                        for c in self._to_add
+                    }
 
-                    if case["name"] in device_case_map:
-                        device_case_id = device_case_map[case["name"]]
-                        stale_locations.update(
-                            device.get_case_track_locations(device_case_id)
-                        )
-                        device.clear_case_tracks(device_case_id)
-                    else:
+                with PacemakerWriter(self._device_db) as device:
+                    for case in self._to_add:
+                        tracks = all_tracks[case["case_id"]]
                         device_case_id = device.create_case(case["name"])
+                        self._sync_map[str(case["case_id"])] = device_case_id
 
-                    for track in tracks:
-                        self.progress.emit(
-                            done, total_tracks,
-                            f"Copying: {os.path.basename(track.location)}"
-                        )
-
-                        if not os.path.exists(track.location):
-                            skipped += 1
-                            done += 1
-                            continue
-
-                        try:
-                            _win_dest, pmdb_loc = self._copy_track(
-                                track.location, self._device_db
+                        for track in tracks:
+                            self.progress.emit(
+                                done, max(total_tracks, 1),
+                                f"Copying: {os.path.basename(track.location)}"
                             )
-                        except Exception:
-                            skipped += 1
+                            if not os.path.exists(track.location):
+                                skipped += 1
+                                done += 1
+                                continue
+                            try:
+                                _win_dest, pmdb_loc = self._copy_track(
+                                    track.location, self._device_db
+                                )
+                            except Exception:
+                                skipped += 1
+                                done += 1
+                                continue
+                            device_track = dataclasses.replace(track, location=pmdb_loc)
+                            tid = device.insert_or_get_track(device_track)
+                            device.link_track_to_case(device_case_id, tid)
                             done += 1
-                            continue
 
-                        # Store the Linux-style /pmdb_tracks/... path in the DB,
-                        # not the Windows path — this is what the firmware reads.
-                        device_track = dataclasses.replace(track, location=pmdb_loc)
-                        tid = device.insert_or_get_track(device_track)
-                        device.link_track_to_case(device_case_id, tid)
-                        done += 1
+            # ── Phase 3: Persist sync map to device ───────────────────────
+            _write_sync_map(self._device_db, self._sync_map)
 
-                if stale_locations:
-                    device.delete_orphan_tracks(list(stale_locations))
-
-            msg = f"Pushed {len(self._cases)} case(s) to device ({done - skipped} tracks copied)."
+            parts = []
+            if self._to_add:
+                parts.append(
+                    f"Added {len(self._to_add)} case(s) "
+                    f"({done - skipped} tracks copied)"
+                )
+            if removed:
+                parts.append(f"Removed {removed} case(s) from device")
             if skipped:
-                msg += f"\n\n{skipped} track(s) were skipped (file not found or copy error)."
+                parts.append(f"{skipped} track(s) skipped (file not found)")
+            msg = ".  ".join(parts) + "." if parts else "Device already in sync."
             self.finished.emit(True, msg)
+
         except Exception as e:
             self.finished.emit(False, str(e))
 
@@ -553,10 +715,31 @@ class MainWindow(QMainWindow):
         self._push_thread: QThread | None = None
         self._push_progress_dlg: QProgressDialog | None = None
 
+        # Inline waveform preview player (separate from the main PlayerBar)
+        self._preview_row: int = -1
+        self._preview_seek_fraction: float = 0.0   # seek target when media loads
+        if _PREVIEW_OK:
+            self._preview_player = QMediaPlayer()
+            self._preview_audio_out = QAudioOutput()
+            self._preview_player.setAudioOutput(self._preview_audio_out)
+            self._preview_audio_out.setVolume(0.7)
+            self._preview_player.mediaStatusChanged.connect(
+                self._on_preview_media_status
+            )
+        else:
+            self._preview_player = None
+            self._preview_audio_out = None
+
         self._build_menu()
         self._build_ui()
         self._load_rekordbox()
         self._autodetect_pacemaker_dbs()
+
+        # Poll for Pacemaker device every 2 s; stops once a device is loaded.
+        self._device_poll_timer = QTimer(self)
+        self._device_poll_timer.setInterval(2000)
+        self._device_poll_timer.timeout.connect(self._poll_for_device)
+        self._device_poll_timer.start()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -581,74 +764,264 @@ class MainWindow(QMainWindow):
         file_menu.addAction(exit_action)
 
     def _build_ui(self):
-        # Rekordbox playlist tree
-        self._tree = PlaylistTreeWidget()
-        self._tree.selection_changed.connect(self._on_selection_changed)
-
-        # Sync panel (Rekordbox → Editor)
+        # ── Hidden state manager — not added to any layout ────────────────
         self._panel = SyncPanel()
         self._panel.db_path_changed.connect(self._on_editor_db_changed)
 
-        # Left splitter: tree + sync queue
-        left_splitter = QSplitter(Qt.Orientation.Horizontal)
-        left_splitter.addWidget(self._tree)
-        left_splitter.addWidget(self._panel)
-        left_splitter.setSizes([380, 220])
+        # ── Rekordbox playlist tree ───────────────────────────────────────
+        self._tree = PlaylistTreeWidget()
+        self._tree.selection_changed.connect(self._on_selection_changed)
 
-        # Editor library panel
+        # ── Editor library panel ──────────────────────────────────────────
         self._editor_panel = PacemakerLibraryPanel(
-            title="Editor Library",
+            title="EDITOR LIBRARY",
             show_browse=False,
             show_push_button=True,
             show_rename=True,
             show_checkboxes=True,
+            show_tracklist=False,
+            show_selection_size=True,
         )
         self._editor_panel.refresh_requested.connect(self._load_editor_library)
         self._editor_panel.delete_requested.connect(self._on_delete_editor_case)
         self._editor_panel.rename_requested.connect(self._on_rename_editor_case)
-        self._editor_panel.push_requested.connect(self._confirm_and_push_to_device)
+        self._editor_panel.push_requested.connect(self._confirm_and_sync_to_device)
+        self._editor_panel.case_selected.connect(self._on_editor_case_selected)
 
-        # Device library panel
+        # ── Device library panel ──────────────────────────────────────────
         self._device_panel = PacemakerLibraryPanel(
-            title="Device Library",
+            title="DEVICE",
             show_browse=True,
             show_push_button=False,
             show_eject=True,
+            show_tracklist=False,
+            show_storage=True,
         )
         self._device_panel.refresh_requested.connect(self._load_device_library)
         self._device_panel.delete_requested.connect(self._on_delete_device_case)
         self._device_panel.db_path_changed.connect(self._on_device_db_changed)
         self._device_panel.eject_requested.connect(self._eject_device)
+        self._device_panel.case_selected.connect(self._on_device_case_selected)
 
-        # Connect the sync button (lives in the connector strip, not in SyncPanel)
-        self._panel.sync_button.clicked.connect(self._confirm_and_sync)
+        # ── Player bar (top, like Rekordbox) ──────────────────────────────
+        self._player_bar = PlayerBar()
+        self._player_bar.track_changed.connect(self._on_player_track_changed)
+        self._player_bar.track_changed.connect(lambda _: self._stop_preview())
 
-        # Assemble: [left_splitter] [sync_btn] [editor_panel] [push_btn] [device_panel]
-        container = QWidget()
-        main_layout = QHBoxLayout(container)
-        main_layout.setSpacing(0)
-        main_layout.setContentsMargins(0, 0, 0, 0)
+        # ── Toolbar ───────────────────────────────────────────────────────
+        toolbar = self._build_toolbar()
 
-        main_layout.addWidget(left_splitter, stretch=3)
-        main_layout.addWidget(self._make_connector(self._panel.sync_button))
-        main_layout.addWidget(self._editor_panel, stretch=2)
-        main_layout.addWidget(self._make_connector(self._editor_panel.push_button))
-        main_layout.addWidget(self._device_panel, stretch=2)
+        # ── Rekordbox tree column ─────────────────────────────────────────
+        from ui.style import ACCENT, BORDER
+        _accent_ss_rb = (
+            f"QPushButton {{ background-color: {ACCENT}; color: #ffffff; "
+            f"font-weight: bold; border: none; border-radius: 0; padding: 6px; }}"
+            f"QPushButton:hover {{ background-color: #ff7a30; }}"
+            f"QPushButton:disabled {{ background-color: #5a3010; color: #666666; }}"
+        )
+        import_btn = self._panel.sync_button
+        import_btn.setText("↓  Import from Rekordbox")
+        import_btn.setFixedHeight(34)
+        import_btn.setStyleSheet(_accent_ss_rb)
+        import_btn.clicked.connect(self._confirm_and_sync)
 
-        self.setCentralWidget(container)
+        rb_col = QWidget()
+        rb_layout = QVBoxLayout(rb_col)
+        rb_layout.setContentsMargins(0, 0, 0, 0)
+        rb_layout.setSpacing(0)
+        rb_layout.addWidget(self._make_section_header("REKORDBOX LIBRARY"))
+        rb_layout.addWidget(self._tree, stretch=1)
+        rb_layout.addWidget(import_btn)
+
+        # ── Central track area ────────────────────────────────────────────
+        main_area = self._build_main_area()
+
+        # ── Sync connector strip (between track table and device panel) ───
+        sync_connector = self._make_sync_connector()
+
+        # ── 5-column content splitter ─────────────────────────────────────
+        # RB tree | Editor Library | Track table | Sync connector | Device
+        content = QSplitter(Qt.Orientation.Horizontal)
+        content.addWidget(rb_col)
+        content.addWidget(self._editor_panel)
+        content.addWidget(main_area)
+        content.addWidget(sync_connector)
+        content.addWidget(self._device_panel)
+        content.setSizes([220, 210, 900, 48, 220])
+        content.setStretchFactor(0, 0)
+        content.setStretchFactor(1, 0)
+        content.setStretchFactor(2, 1)
+        content.setStretchFactor(3, 0)
+        content.setStretchFactor(4, 0)
+        content.setCollapsible(3, False)  # connector strip — not collapsible
+
+        # ── Root ──────────────────────────────────────────────────────────
+        root = QWidget()
+        root_layout = QVBoxLayout(root)
+        root_layout.setSpacing(0)
+        root_layout.setContentsMargins(0, 0, 0, 0)
+        root_layout.addWidget(toolbar)
+        root_layout.addWidget(self._player_bar)   # player at TOP like Rekordbox
+        root_layout.addWidget(content, stretch=1)
+        self.setCentralWidget(root)
+
+    # ── Layout builders ───────────────────────────────────────────────────
+
+    def _build_toolbar(self) -> QWidget:
+        from ui.style import ACCENT, BG_MAIN, BORDER, FG_SECONDARY
+        _accent_ss = (
+            f"QPushButton {{ background-color: {ACCENT}; color: #ffffff; "
+            f"font-weight: bold; border: none; border-radius: 3px; padding: 4px 14px; }}"
+            f"QPushButton:hover {{ background-color: #ff7a30; }}"
+            f"QPushButton:disabled {{ background-color: #5a3010; color: #666666; }}"
+        )
+
+        bar = QWidget()
+        bar.setFixedHeight(46)
+        bar.setStyleSheet(
+            f"QWidget {{ background-color: {BG_MAIN}; border-bottom: 1px solid {BORDER}; }}"
+        )
+        layout = QHBoxLayout(bar)
+        layout.setContentsMargins(12, 6, 12, 6)
+        layout.setSpacing(8)
+
+        brand = QLabel("RB → PM")
+        brand.setStyleSheet(f"color: {ACCENT}; font-weight: bold; font-size: 14px; border: none;")
+        layout.addWidget(brand)
+
+        sep = QFrame(); sep.setFrameShape(QFrame.Shape.VLine)
+        sep.setStyleSheet(f"color: {BORDER}; border: none;")
+        layout.addWidget(sep)
+
+        # Import button lives at the bottom of the RB tree panel, not the toolbar
+
+        layout.addStretch()
+
+        self._editor_path_lbl = QLabel("Editor: not loaded")
+        self._editor_path_lbl.setStyleSheet(f"color: {FG_SECONDARY}; font-size: 10px; border: none;")
+        layout.addWidget(self._editor_path_lbl)
+
+        sep2 = QFrame(); sep2.setFrameShape(QFrame.Shape.VLine)
+        sep2.setStyleSheet(f"color: {BORDER}; border: none;")
+        layout.addWidget(sep2)
+
+        self._device_path_lbl = QLabel("Device: not connected")
+        self._device_path_lbl.setStyleSheet(f"color: {FG_SECONDARY}; font-size: 10px; border: none;")
+        layout.addWidget(self._device_path_lbl)
+
+        return bar
+
+    def _make_sync_connector(self) -> QWidget:
+        """Narrow vertical strip housing the Sync button, between track table and device panel."""
+        from ui.style import ACCENT, BG_MAIN, BORDER
+        _accent_ss = (
+            f"QPushButton {{ background-color: {ACCENT}; color: #ffffff; "
+            f"font-weight: bold; border: none; border-radius: 3px; "
+            f"padding: 6px 4px; font-size: 11px; }}"
+            f"QPushButton:hover {{ background-color: #ff7a30; }}"
+            f"QPushButton:disabled {{ background-color: #5a3010; color: #666666; }}"
+        )
+
+        strip = QWidget()
+        strip.setFixedWidth(48)
+        strip.setStyleSheet(
+            f"QWidget {{ background-color: {BG_MAIN}; "
+            f"border-left: 1px solid {BORDER}; border-right: 1px solid {BORDER}; }}"
+        )
+        layout = QVBoxLayout(strip)
+        layout.setContentsMargins(4, 0, 4, 0)
+        layout.setSpacing(0)
+
+        push_btn = self._editor_panel.push_button
+        push_btn.setText("Sync\n\u25b6")
+        push_btn.setFixedWidth(40)
+        push_btn.setFixedHeight(60)
+        push_btn.setEnabled(False)   # enabled when device connects
+        push_btn.setStyleSheet(_accent_ss)
+
+        layout.addStretch()
+        layout.addWidget(push_btn, alignment=Qt.AlignmentFlag.AlignHCenter)
+        layout.addStretch()
+        return strip
+
+    def _build_main_area(self) -> QWidget:
+        from ui.style import BG_PANEL, BORDER, FG_SECONDARY
+
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        # Track view header bar
+        hdr = QWidget()
+        hdr.setFixedHeight(30)
+        hdr.setStyleSheet(
+            f"background-color: {BG_PANEL}; border-bottom: 1px solid {BORDER};"
+        )
+        hdr_layout = QHBoxLayout(hdr)
+        hdr_layout.setContentsMargins(12, 0, 12, 0)
+        self._track_view_lbl = QLabel("Select a playlist or case to view tracks")
+        self._track_view_lbl.setStyleSheet(f"color: {FG_SECONDARY}; font-size: 11px;")
+        hdr_layout.addWidget(self._track_view_lbl)
+        hdr_layout.addStretch()
+        layout.addWidget(hdr)
+
+        # Central track table  cols: #  ★  ~wave  Title  Artist  BPM  Key  Time  Genre
+        self._track_table = QTableWidget(0, 9)
+        self._track_table.setHorizontalHeaderLabels(
+            ["#", "★", "~", "Title", "Artist", "BPM", "Key", "Time", "Genre"]
+        )
+        hh = self._track_table.horizontalHeader()
+        for col, mode in enumerate([
+            QHeaderView.ResizeMode.Fixed,    # #
+            QHeaderView.ResizeMode.Fixed,    # ★
+            QHeaderView.ResizeMode.Fixed,    # ~ waveform
+            QHeaderView.ResizeMode.Stretch,  # Title
+            QHeaderView.ResizeMode.Stretch,  # Artist
+            QHeaderView.ResizeMode.Fixed,    # BPM
+            QHeaderView.ResizeMode.Fixed,    # Key
+            QHeaderView.ResizeMode.Fixed,    # Time
+            QHeaderView.ResizeMode.Fixed,    # Genre
+        ]):
+            hh.setSectionResizeMode(col, mode)
+        self._track_table.setColumnWidth(0, 36)
+        self._track_table.setColumnWidth(1, 26)
+        self._track_table.setColumnWidth(2, 120)   # waveform preview
+        self._track_table.setColumnWidth(5, 52)
+        self._track_table.setColumnWidth(6, 58)
+        self._track_table.setColumnWidth(7, 56)
+        self._track_table.setColumnWidth(8, 100)
+        self._wave_delegate = _WaveformDelegate(self._track_table)
+        self._track_table.setItemDelegateForColumn(2, self._wave_delegate)
+
+        self._track_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        self._track_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._track_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._track_table.verticalHeader().setVisible(False)
+        self._track_table.setAlternatingRowColors(True)
+        self._track_table.setSortingEnabled(True)
+        self._track_table.verticalHeader().setDefaultSectionSize(22)
+        self._track_table.itemDoubleClicked.connect(self._on_track_double_clicked)
+        self._track_table.viewport().installEventFilter(self)
+
+        # Store tracks and source for playback
+        self._track_table_tracks: list[TrackInfo] = []
+        self._track_table_source: str = ""   # "editor" | "device" | ""
+
+        layout.addWidget(self._track_table, stretch=1)
+        return widget
 
     @staticmethod
-    def _make_connector(button: QPushButton) -> QWidget:
-        """Narrow vertical strip that centres a button between two panels."""
-        widget = QWidget()
-        widget.setFixedWidth(115)
-        layout = QVBoxLayout(widget)
-        layout.setContentsMargins(4, 4, 4, 4)
-        button.setFixedWidth(105)
-        layout.addStretch()
-        layout.addWidget(button)
-        layout.addStretch()
-        return widget
+    def _make_section_header(title: str) -> QLabel:
+        from ui.style import BG_MAIN, FG_SECONDARY
+        lbl = QLabel(title)
+        lbl.setFixedHeight(24)
+        lbl.setStyleSheet(
+            f"background-color: {BG_MAIN}; color: {FG_SECONDARY}; "
+            f"font-size: 10px; font-weight: bold; padding: 0 8px;"
+        )
+        lbl.setAlignment(Qt.AlignmentFlag.AlignVCenter)
+        return lbl
 
     # ------------------------------------------------------------------
     # Auto-detection
@@ -677,6 +1050,7 @@ class MainWindow(QMainWindow):
             self._rb_reader = RekordboxReader()
             self._playlist_nodes = self._rb_reader.get_playlist_tree()
             self._refresh_tree()
+            self._player_bar.set_rekordbox_reader(self._rb_reader)
             self.statusBar().showMessage("Rekordbox library loaded.")
         except Exception as e:
             self.statusBar().showMessage(f"Could not load Rekordbox: {e}")
@@ -773,7 +1147,7 @@ class MainWindow(QMainWindow):
         folder_parts = parts[:-1]
         playlist_name = parts[-1]
 
-        short_folders = [MainWindow._shorten_segment(f, 3) for f in folder_parts]
+        short_folders = [MainWindow._shorten_segment(f, 4) for f in folder_parts]
         pl_clean = re.sub(r"^\d+\s*[-–]\s*", "", playlist_name).strip()
         pl_compact = pl_clean.replace(" ", "")[:12]
 
@@ -857,10 +1231,10 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(message)
 
     # ------------------------------------------------------------------
-    # Editor → Device push
+    # Editor → Device sync  (Rekordbox-style: checked = on device)
     # ------------------------------------------------------------------
 
-    def _confirm_and_push_to_device(self):
+    def _confirm_and_sync_to_device(self):
         editor_db = self._panel.db_path
         device_db = self._device_panel.db_path
 
@@ -875,78 +1249,120 @@ class MainWindow(QMainWindow):
             )
             return
 
-        cases = self._editor_panel.get_checked_cases()
-        if not cases:
-            QMessageBox.information(
-                self, "Nothing Checked",
-                "Tick the cases you want to push in the Editor Library."
-            )
+        # All Editor cases and which are checked
+        try:
+            with PacemakerWriter(editor_db) as writer:
+                all_editor_cases = writer.get_all_cases()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
             return
 
-        reply = QMessageBox.question(
-            self, "Push to Device",
-            f"Push {len(cases)} checked case(s) to the device?\n\n"
-            "Cases already on the device (matched by name) will be updated.\n"
-            "Unchecked cases and device-only cases are left untouched.",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply != QMessageBox.StandardButton.Yes:
+        editor_case_by_id = {c["case_id"]: c for c in all_editor_cases}
+        checked_ids = {c["case_id"] for c in self._editor_panel.get_checked_cases()}
+
+        # Current sync map — tells us what is already on this device
+        sync_map = _read_sync_map(device_db)
+        synced_editor_ids = {int(k) for k in sync_map}
+
+        # Diff: new cases to push, existing cases to remove
+        to_add = [
+            editor_case_by_id[eid] for eid in checked_ids
+            if eid not in synced_editor_ids and eid in editor_case_by_id
+        ]
+        to_remove = [
+            {
+                "editor_case_id": int(k),
+                "device_case_id": v,
+                "name": editor_case_by_id.get(int(k), {}).get("name", str(k)),
+            }
+            for k, v in sync_map.items()
+            if int(k) not in checked_ids
+        ]
+
+        if not to_add and not to_remove:
+            self.statusBar().showMessage("Device already in sync with checked cases.")
             return
 
-        self._run_push(editor_db, device_db, cases)
+        self._run_device_sync(editor_db, device_db, to_add, to_remove, sync_map)
 
-    def _run_push(self, editor_db: str, device_db: str, cases: list):
+    def _run_device_sync(self, editor_db: str, device_db: str,
+                         to_add: list, to_remove: list, sync_map: dict):
         self._editor_panel.setEnabled(False)
         self._device_panel.setEnabled(False)
+        self._editor_panel.push_button.setEnabled(False)
 
-        total_tracks = sum(c.get("track_count", 0) for c in cases)
+        total_tracks = sum(c.get("track_count", 0) for c in to_add)
         self._push_progress_dlg = QProgressDialog(
-            f"Copying tracks to device…", None, 0, max(total_tracks, 1), self
+            "Syncing to device…", None, 0, max(total_tracks, 1), self
         )
-        self._push_progress_dlg.setWindowTitle("Push to Device")
+        self._push_progress_dlg.setWindowTitle("Sync to Device")
         self._push_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
         self._push_progress_dlg.setMinimumDuration(0)
         self._push_progress_dlg.setValue(0)
         self._push_progress_dlg.show()
 
         self._push_thread = QThread()
-        self._push_worker = DevicePushWorker(editor_db, device_db, cases)
+        self._push_worker = DeviceSyncWorker(editor_db, device_db, to_add, to_remove, sync_map)
         self._push_worker.moveToThread(self._push_thread)
 
         self._push_thread.started.connect(self._push_worker.run)
-        self._push_worker.progress.connect(self._on_push_progress)
-        self._push_worker.finished.connect(self._on_push_finished)
+        self._push_worker.progress.connect(self._on_device_sync_progress)
+        self._push_worker.finished.connect(self._on_device_sync_finished)
         self._push_worker.finished.connect(self._push_thread.quit)
 
         self._push_thread.start()
 
-    def _on_push_progress(self, current: int, total: int, status: str):
+    def _on_device_sync_progress(self, current: int, total: int, status: str):
         if self._push_progress_dlg:
             self._push_progress_dlg.setValue(current)
             self._push_progress_dlg.setLabelText(status)
 
-    def _on_push_finished(self, success: bool, message: str):
+    def _on_device_sync_finished(self, success: bool, message: str):
         if self._push_progress_dlg:
             self._push_progress_dlg.close()
             self._push_progress_dlg = None
 
         self._editor_panel.setEnabled(True)
         self._device_panel.setEnabled(True)
+        self._editor_panel.push_button.setEnabled(True)
 
         if success:
-            QMessageBox.information(self, "Push Complete", message)
+            self._play_completion_sound()
+            QMessageBox.information(self, "Sync Complete", message)
             self._load_device_library()
+            self._apply_device_sync_state()
         else:
-            QMessageBox.critical(self, "Push Failed", f"An error occurred:\n\n{message}")
+            QMessageBox.critical(self, "Sync Failed", f"An error occurred:\n\n{message}")
 
         self.statusBar().showMessage(message)
+
+    @staticmethod
+    def _play_completion_sound() -> None:
+        """Play a short completion chime using Windows MessageBeep (no extra deps)."""
+        try:
+            import winsound
+            winsound.MessageBeep(winsound.MB_ICONASTERISK)  # asterisk = info chime
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------
     # Editor library panel
     # ------------------------------------------------------------------
 
     def _on_editor_db_changed(self, path: str):
+        short = os.path.basename(os.path.dirname(path)) if path else ""
+        self._editor_path_lbl.setText(f"Editor: {short or 'not loaded'}")
         self._editor_panel.set_db_path_label(path)
+        if path:
+            try:
+                with PacemakerWriter(path) as w:
+                    fixed = w.fix_bpm_values()
+                if fixed:
+                    self.statusBar().showMessage(
+                        f"Migrated {fixed} track BPM value(s) from ×100 format."
+                    )
+            except Exception:
+                pass
         self._refresh_tree()
         self._recompute_queue()
         self._load_editor_library()
@@ -963,6 +1379,233 @@ class MainWindow(QMainWindow):
         except Exception as e:
             self._editor_panel.clear()
             self.statusBar().showMessage(f"Could not read Editor library: {e}")
+            return
+        self._apply_device_sync_state()
+
+    def _on_editor_case_selected(self, case_id: int) -> None:
+        """Load Editor case tracks into the central track table."""
+        db_path = self._panel.db_path
+        if not db_path or case_id == -1:
+            self._clear_track_table()
+            return
+        try:
+            with PacemakerWriter(db_path) as writer:
+                tracks = writer.get_case_tracks_as_trackinfo(case_id)
+            case = self._editor_panel.selected_case()
+            name = case["name"] if case else "Case"
+            self._load_tracks_in_table(tracks, source="editor",
+                                       label=f"{name}  —  {len(tracks)} tracks")
+        except Exception:
+            self._clear_track_table()
+
+    def _on_device_case_selected(self, case_id: int) -> None:
+        """Load Device case tracks into the central track table (read-only)."""
+        db_path = self._device_panel.db_path
+        if not db_path or case_id == -1:
+            self._clear_track_table()
+            return
+        try:
+            with PacemakerWriter(db_path) as writer:
+                tracks = writer.get_case_tracks_as_trackinfo(case_id)
+            case = self._device_panel.selected_case()
+            name = case["name"] if case else "Case"
+            self._load_tracks_in_table(tracks, source="device",
+                                       label=f"{name}  —  {len(tracks)} tracks  [device]")
+        except Exception:
+            self._clear_track_table()
+
+    def _load_tracks_in_table(self, tracks: list[TrackInfo], source: str, label: str) -> None:
+        """Populate the central track table. source='editor'|'device'."""
+        from ui.style import ACCENT
+        from PyQt6.QtGui import QColor as _QColor
+
+        # Stop any inline preview that was running for the previous case
+        self._stop_preview()
+
+        # Cancel any running waveform batch
+        if hasattr(self, "_wave_worker") and self._wave_worker:
+            self._wave_worker.cancel()
+
+        self._track_table.setSortingEnabled(False)
+        self._track_table.setRowCount(0)
+        self._track_table_tracks = list(tracks)
+        self._track_table_source = source
+        self._track_view_lbl.setText(label)
+
+        STAR_MAP = {0: "", 1: "★", 2: "★★", 3: "★★★", 4: "★★★★", 5: "★★★★★"}
+
+        for i, t in enumerate(tracks):
+            self._track_table.insertRow(i)
+            secs = int(t.play_time_secs or 0)
+            duration = f"{secs // 60}:{secs % 60:02d}"
+            bpm_val = int(t.bpm) if t.bpm else 0
+            if bpm_val > 1000:
+                bpm_val = round(bpm_val / 100)
+            bpm = str(bpm_val) if bpm_val else ""
+            stars = STAR_MAP.get(t.rating, "")
+
+            # cols: #(0) ★(1) ~wave(2) Title(3) Artist(4) BPM(5) Key(6) Time(7) Genre(8)
+            _numeric_sort = {0: i + 1, 5: bpm_val, 7: secs}
+            for col, val in enumerate([
+                str(i + 1), stars, "", t.title or "", t.artist or "",
+                bpm, t.key or "", duration, t.genre or "",
+            ]):
+                item = _SortableItem(val)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                item.setData(Qt.ItemDataRole.UserRole, i)
+                if col in _numeric_sort:
+                    item.setData(_SortableItem._SORT_ROLE, _numeric_sort[col])
+                if col in (0, 1, 2, 5, 6, 7):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                if col == 1 and val:
+                    item.setForeground(_QColor(ACCENT))
+                self._track_table.setItem(i, col, item)
+
+        self._track_table.setSortingEnabled(True)
+
+        # Fetch waveforms in background (only for editor source where we have RB data)
+        if source == "editor" and self._rb_reader and tracks:
+            self._start_waveform_batch([t.location for t in tracks])
+
+    def _start_waveform_batch(self, locations: list[str]) -> None:
+        self._wave_thread = QThread()
+        self._wave_worker = _WaveformBatchWorker(self._rb_reader, locations)
+        self._wave_worker.moveToThread(self._wave_thread)
+        self._wave_thread.started.connect(self._wave_worker.run)
+        self._wave_worker.row_done.connect(self._on_wave_row_done)
+        self._wave_worker.finished.connect(self._wave_thread.quit)
+        self._wave_thread.start()
+
+    def _on_wave_row_done(self, row: int, data) -> None:
+        if row < self._track_table.rowCount():
+            item = self._track_table.item(row, 2)
+            if item and data:
+                item.setData(_WAVE_COL_ROLE, data)
+                # Force repaint of this cell
+                self._track_table.update(
+                    self._track_table.model().index(row, 2)
+                )
+
+    def _clear_track_table(self) -> None:
+        self._track_table.setRowCount(0)
+        self._track_table_tracks = []
+        self._track_table_source = ""
+        self._track_view_lbl.setText("Select a playlist or case to view tracks")
+
+    def _on_track_double_clicked(self, item: QTableWidgetItem) -> None:
+        """Play the double-clicked track (Editor source only)."""
+        if self._track_table_source != "editor":
+            return
+        orig_row = item.data(Qt.ItemDataRole.UserRole)
+        if orig_row is None:
+            orig_row = item.row()
+        if 0 <= orig_row < len(self._track_table_tracks):
+            self._player_bar.load_and_play(self._track_table_tracks, orig_row)
+
+    def _on_player_track_changed(self, index: int) -> None:
+        """Highlight the currently playing track row in the table."""
+        from PyQt6.QtGui import QColor
+        from ui.style import ACCENT
+        if self._track_table_source != "editor":
+            return
+        for row in range(self._track_table.rowCount()):
+            item = self._track_table.item(row, 0)
+            if item and item.data(Qt.ItemDataRole.UserRole) == index:
+                self._track_table.selectRow(row)
+                break
+
+    # ------------------------------------------------------------------
+    # Inline waveform click-to-preview
+    # ------------------------------------------------------------------
+
+    _STOP_BTN_WIDTH = 20   # px from left edge of the waveform cell that acts as stop
+
+    def eventFilter(self, obj, event) -> bool:
+        """Intercept mouse clicks on the track table viewport to handle waveform col."""
+        if obj is self._track_table.viewport():
+            if event.type() == QEvent.Type.MouseButtonPress:
+                if event.button() == Qt.MouseButton.LeftButton:
+                    index = self._track_table.indexAt(event.pos())
+                    if index.isValid() and index.column() == 2:
+                        cell_rect = self._track_table.visualRect(index)
+                        x_in_cell = event.pos().x() - cell_rect.left()
+                        fraction = max(0.0, min(1.0,
+                            x_in_cell / max(cell_rect.width(), 1)
+                        ))
+                        self._on_wave_cell_clicked_at(index.row(), fraction, x_in_cell)
+                        return True   # consume — prevent default selection noise
+        return super().eventFilter(obj, event)
+
+    def _on_wave_cell_clicked_at(self, row: int, fraction: float, x_in_cell: float) -> None:
+        """
+        Handle a click inside the waveform cell of `row`.
+
+        - Active preview row + click in left stop zone  → stop.
+        - Active preview row + click outside stop zone  → seek.
+        - Different row                                  → start from clicked position.
+        """
+        item = self._track_table.item(row, 0)
+        orig_row = item.data(Qt.ItemDataRole.UserRole) if item else row
+        if orig_row is None:
+            orig_row = row
+        if not (0 <= orig_row < len(self._track_table_tracks)):
+            return
+
+        track = self._track_table_tracks[orig_row]
+
+        if self._preview_row == row:
+            # Stop button zone (left edge)
+            if x_in_cell <= self._STOP_BTN_WIDTH:
+                self._stop_preview()
+                return
+            # Outside stop zone: seek to clicked position
+            if self._preview_player:
+                dur = self._preview_player.duration()
+                if dur <= 0:
+                    dur = int(track.play_time_secs * 1000)
+                if dur > 0:
+                    self._preview_player.setPosition(int(fraction * dur))
+        else:
+            # New row: stop current preview and main player, start from clicked position
+            if not os.path.exists(track.location):
+                self.statusBar().showMessage(f"File not found: {track.location}")
+                return
+            self._player_bar.stop()
+            self._stop_preview()
+            self._preview_row = row
+            self._wave_delegate.preview_row = row
+            self._preview_seek_fraction = fraction
+            if self._preview_player:
+                self._preview_player.setSource(QUrl.fromLocalFile(track.location))
+                self._preview_player.play()
+            self._track_table.viewport().update()
+
+    def _stop_preview(self) -> None:
+        """Stop the inline preview and clear the stop-button overlay."""
+        if self._preview_player:
+            self._preview_player.stop()
+        self._preview_seek_fraction = 0.0
+        old = self._preview_row
+        self._preview_row = -1
+        self._wave_delegate.preview_row = -1
+        if old >= 0:
+            self._track_table.viewport().update()
+
+    def _on_preview_media_status(self, status) -> None:
+        """Seek to the clicked position once media is loaded; stop at end."""
+        if not _PREVIEW_OK:
+            return
+        if status == QMediaPlayer.MediaStatus.LoadedMedia:
+            # Media just loaded — apply the initial seek if the user clicked mid-track
+            if self._preview_seek_fraction > 0.0 and self._preview_player:
+                dur = self._preview_player.duration()
+                if dur > 0:
+                    self._preview_player.setPosition(
+                        int(self._preview_seek_fraction * dur)
+                    )
+                self._preview_seek_fraction = 0.0
+        elif status == QMediaPlayer.MediaStatus.EndOfMedia:
+            self._stop_preview()
 
     def _on_delete_editor_case(self, cases: list):
         self._delete_cases(
@@ -1015,14 +1658,56 @@ class MainWindow(QMainWindow):
         if not db_path:
             self._device_panel.clear()
             return
+        # Migrate any ×100 BPM values that may be in the device DB
+        try:
+            with PacemakerWriter(db_path) as w:
+                fixed = w.fix_bpm_values()
+            if fixed:
+                self.statusBar().showMessage(
+                    f"Migrated {fixed} track BPM value(s) in device DB from ×100 format."
+                )
+        except Exception:
+            pass
         try:
             with PacemakerWriter(db_path) as writer:
                 cases = writer.get_all_cases()
-            # Device has no sync state — show all cases without green highlighting
             self._device_panel.load_cases(cases, set())
         except Exception as e:
             self._device_panel.clear()
             self.statusBar().showMessage(f"Could not read Device library: {e}")
+            return
+        self._load_device_storage()
+        self._apply_device_sync_state()
+
+    def _load_device_storage(self) -> None:
+        """Read device drive free/total space and used bytes from DB, update storage bar."""
+        import ctypes
+        device_db = self._device_panel.db_path
+        if not device_db:
+            return
+        drive = os.path.splitdrive(device_db)[0] + os.sep  # e.g. "J:\"
+
+        # Get drive capacity from OS
+        free_bytes = ctypes.c_ulonglong(0)
+        total_bytes = ctypes.c_ulonglong(0)
+        ctypes.windll.kernel32.GetDiskFreeSpaceExW(
+            drive, None, ctypes.byref(total_bytes), ctypes.byref(free_bytes)
+        )
+        total = total_bytes.value
+        free = free_bytes.value
+        used = total - free
+
+        self._device_panel.set_storage_info(used, total)
+
+    def _apply_device_sync_state(self) -> None:
+        """Read sync map from device and check the corresponding Editor cases."""
+        device_db = self._device_panel.db_path
+        if not device_db or not self._panel.db_path:
+            return
+        sync_map = _read_sync_map(device_db)
+        synced_editor_ids = {int(k) for k in sync_map}
+        self._editor_panel.set_checked_cases(synced_editor_ids)
+        self._editor_panel.push_button.setEnabled(True)
 
     def _on_delete_device_case(self, cases: list):
         self._delete_cases(
@@ -1033,43 +1718,112 @@ class MainWindow(QMainWindow):
         )
 
     def _eject_device(self):
-        import subprocess
         db_path = self._device_panel.db_path
         if not db_path:
             return
         drive = os.path.splitdrive(db_path)[0]   # e.g. "J:"
         letter = drive.rstrip(":")               # "J"
 
-        # Use a PowerShell script that:
-        # 1. Flushes the volume (via mountvol /p — safe removal)
-        # 2. Falls back to Shell.Application eject if that fails
-        # Run synchronously (wait=True) so we know when it's done.
-        ps_script = (
-            f"$vol = '{letter}:';"
-            f"$shell = New-Object -comObject Shell.Application;"
-            f"$drive = $shell.Namespace(17).ParseName($vol);"
-            f"if ($drive) {{ $drive.InvokeVerb('Eject') }}"
-        )
-        try:
-            result = subprocess.run(
-                ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps_script],
-                creationflags=subprocess.CREATE_NO_WINDOW,
-                capture_output=True,
-                timeout=15,
-            )
-            self._device_panel.set_db_path_label("")
-            self._device_panel.clear()
-            self.statusBar().showMessage(
-                f"{drive} ejected — safe to disconnect."
-            )
-        except subprocess.TimeoutExpired:
+        ok, err = self._do_eject(letter)
+        # Clear the UI regardless — the device is being disconnected
+        self._device_panel.set_db_path_label("")
+        self._device_panel.clear()
+        self._device_path_lbl.setText("Device: not connected")
+        # Uncheck all Editor cases and disable Sync button (no device connected)
+        self._editor_panel.set_checked_cases(set())
+        self._editor_panel.push_button.setEnabled(False)
+        if ok:
+            self.statusBar().showMessage(f"{drive} ejected — safe to disconnect.")
+        else:
             QMessageBox.warning(
-                self, "Eject Timeout",
-                "The eject command timed out. The device may still be in use.\n"
-                "Close any open files on the device and try again."
+                self, "Eject Failed",
+                f"Could not safely eject {drive}.\n"
+                f"{err}\n\n"
+                "Use 'Safely Remove Hardware' in the system tray."
             )
-        except Exception as e:
-            QMessageBox.warning(self, "Eject Failed", str(e))
+
+    @staticmethod
+    def _do_eject(letter: str):
+        """
+        Physically eject a drive via Windows DeviceIoControl.
+        Sequence: open volume → lock → dismount → eject media.
+        Returns (success: bool, error_message: str).
+        """
+        import ctypes
+        import ctypes.wintypes
+
+        GENERIC_READ           = 0x80000000
+        GENERIC_WRITE          = 0x40000000
+        FILE_SHARE_READ        = 0x00000001
+        FILE_SHARE_WRITE       = 0x00000002
+        OPEN_EXISTING          = 3
+        FSCTL_LOCK_VOLUME      = 0x00090018
+        FSCTL_DISMOUNT_VOLUME  = 0x00090020
+        IOCTL_STORAGE_EJECT_MEDIA = 0x2D4808
+
+        k32 = ctypes.windll.kernel32
+        k32.CreateFileW.restype = ctypes.c_void_p
+
+        handle = k32.CreateFileW(
+            f"\\\\.\\{letter}:",
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            None,
+            OPEN_EXISTING,
+            0,
+            None,
+        )
+        INVALID = ctypes.c_void_p(-1).value
+        if handle is None or handle == INVALID:
+            err = ctypes.WinError().strerror
+            return False, f"Could not open volume: {err}"
+
+        try:
+            br = ctypes.wintypes.DWORD(0)
+            k32.DeviceIoControl(handle, FSCTL_LOCK_VOLUME,
+                                None, 0, None, 0, ctypes.byref(br), None)
+            k32.DeviceIoControl(handle, FSCTL_DISMOUNT_VOLUME,
+                                None, 0, None, 0, ctypes.byref(br), None)
+            ok = k32.DeviceIoControl(handle, IOCTL_STORAGE_EJECT_MEDIA,
+                                     None, 0, None, 0, ctypes.byref(br), None)
+            if not ok:
+                err = ctypes.WinError().strerror
+                return False, f"Eject command failed: {err}"
+            return True, ""
+        finally:
+            k32.CloseHandle(handle)
+
+    # ------------------------------------------------------------------
+    # Device auto-detection (polled every 2 s)
+    # ------------------------------------------------------------------
+
+    def _poll_for_device(self) -> None:
+        """
+        Check all connected drives for a Pacemaker database.
+        Stops polling once a device is loaded; resumes after eject.
+        """
+        if self._device_panel.db_path:
+            return  # Already have a device loaded
+
+        import ctypes
+        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
+        for i in range(26):
+            if bitmask & (1 << i):
+                letter = chr(ord("A") + i)
+                db_path = rf"{letter}:\.Pacemaker\music.db"
+                if os.path.exists(db_path):
+                    self._auto_load_device(db_path)
+                    return
+
+    def _auto_load_device(self, db_path: str) -> None:
+        """Called when a Pacemaker drive is detected. Loads its library."""
+        self._device_panel.set_db_path_label(db_path)
+        self._load_device_library()
+        drive = os.path.splitdrive(db_path)[0]
+        self._device_path_lbl.setText(f"Device: {drive}")
+        self.statusBar().showMessage(
+            f"Pacemaker detected on {drive} — Device Library loaded."
+        )
 
     # ------------------------------------------------------------------
     # Shared delete logic
