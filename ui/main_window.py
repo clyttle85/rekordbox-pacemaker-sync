@@ -36,6 +36,7 @@ except ImportError:
     _PREVIEW_OK = False
 
 from core.rekordbox_reader import RekordboxReader, PlaylistNode, TrackInfo
+from core import logger as _logger
 
 _WAVE_COL_ROLE = Qt.ItemDataRole.UserRole + 3   # stores list[tuple[int,int]] waveform data
 
@@ -77,24 +78,34 @@ class _WaveformDelegate(QStyledItemDelegate):
             return
 
         r = option.rect
+        painter.save()
+        painter.setClipRect(r)
         painter.fillRect(r, QColor("#181818"))
         n = len(data)
-        w = r.width()
+        w = max(r.width(), 1)
         h = r.height()
         mid = r.top() + h / 2
         max_h = h * 0.85 / 2
-        bar_w = max(w / n, 1.0)
         painter.setPen(Qt.PenStyle.NoPen)
-        for i, (height, color_idx) in enumerate(data):
-            bar_h = max((height / 31.0) * max_h, 1.0)
-            x = r.left() + int(i * bar_w)
-            bw = max(int(bar_w), 1)
-            col = _WDELEGATE_COLORS[color_idx % len(_WDELEGATE_COLORS)]
+
+        # Downsample or upsample: map n data points into w pixel columns.
+        # Each pixel column takes the max height and dominant color of its bucket.
+        for px in range(w):
+            lo = int(px * n / w)
+            hi = int((px + 1) * n / w)
+            if hi <= lo:
+                hi = lo + 1
+            bucket = data[lo:hi]
+            peak_h, peak_c = max(bucket, key=lambda v: v[0])
+            bar_h = max((peak_h / 31.0) * max_h, 1.0)
+            x = r.left() + px
+            col = _WDELEGATE_COLORS[peak_c % len(_WDELEGATE_COLORS)]
             painter.setBrush(QBrush(col))
-            painter.drawRect(x, int(mid - bar_h), bw, max(int(bar_h * 2), 1))
+            painter.drawRect(x, int(mid - bar_h), 1, max(int(bar_h * 2), 1))
 
         if is_preview:
             self._draw_stop_icon(painter, r)
+        painter.restore()
 
     @staticmethod
     def _draw_stop_icon(painter: QPainter, rect) -> None:
@@ -166,12 +177,12 @@ def _write_sync_map(device_db: str, sync_map: dict) -> None:
 # ---------------------------------------------------------------------------
 
 class _WaveformBatchWorker(QObject):
-    row_done = pyqtSignal(int, object)   # (row_index, list[(height,color)] or None)
+    row_done = pyqtSignal(int, int, object)  # (generation, row_index, data or None)
     finished = pyqtSignal()
 
-    def __init__(self, rb_reader, locations: list[str]):
+    def __init__(self, generation: int, locations: list[str]):
         super().__init__()
-        self._reader = rb_reader
+        self._generation = generation
         self._locations = locations
         self._cancelled = False
 
@@ -179,11 +190,31 @@ class _WaveformBatchWorker(QObject):
         self._cancelled = True
 
     def run(self):
+        # Open a fresh RekordboxReader in this thread — SQLAlchemy sessions are
+        # not thread-safe so we must never share the main thread's reader here.
+        from core.rekordbox_reader import RekordboxReader
+        from core.logger import log as _log
+        reader = None
+        try:
+            reader = RekordboxReader()
+        except Exception as e:
+            _log.error("WaveformBatch: could not open RekordboxReader: %s", e, exc_info=True)
+
         for i, loc in enumerate(self._locations):
             if self._cancelled:
                 break
-            data = self._reader.get_waveform_data(loc) if self._reader else None
-            self.row_done.emit(i, data)
+            data = None
+            if reader:
+                data = reader.get_waveform_data(loc)
+                if data is None:
+                    _log.debug("WaveformBatch: no waveform data for %s", loc)
+            self.row_done.emit(self._generation, i, data)
+
+        if reader:
+            try:
+                reader.close()
+            except Exception:
+                pass
         self.finished.emit()
 
 
@@ -240,6 +271,30 @@ class DeviceSyncWorker(QObject):
         self._sync_map = dict(sync_map)  # working copy; written to device on completion
 
     @staticmethod
+    def _delete_device_files(locations: list[str], device_db: str) -> None:
+        r"""
+        Delete audio files (and their .str companions) for the given pmdb locations.
+        /pmdb_tracks/a/b/xxxxxxxx.mp3  ->  <drive>:\.Pacemaker\Music\a\b\xxxxxxxx.mp3
+        """
+        device_drive = os.path.splitdrive(device_db)[0]
+        for loc in locations:
+            if loc.startswith("/pmdb_tracks/"):
+                rel = loc[len("/pmdb_tracks/"):].replace("/", os.sep)
+                win_path = os.path.join(
+                    device_drive, os.sep, ".Pacemaker", "Music", rel
+                )
+            else:
+                win_path = loc  # old-format path stored as Windows path
+            try:
+                if os.path.exists(win_path):
+                    os.remove(win_path)
+                str_path = os.path.splitext(win_path)[0] + ".str"
+                if os.path.exists(str_path):
+                    os.remove(str_path)
+            except Exception:
+                pass
+
+    @staticmethod
     def _pmdb_location(src_path: str) -> str:
         """
         Derive the device-side DB location string for a source file.
@@ -285,24 +340,36 @@ class DeviceSyncWorker(QObject):
 
     def run(self):
         try:
+            from core.logger import log as _log
             removed = 0
             done = 0
             skipped = 0
 
             # ── Phase 1: Remove unchecked cases from device ──────────────
             if self._to_remove:
+                _log.info("Device sync: removing %d case(s)", len(self._to_remove))
+                deleted_locs: list[str] = []
                 with PacemakerWriter(self._device_db) as device:
                     for r in self._to_remove:
+                        _log.info("  Removing case: %s (device id %s)", r['name'], r['device_case_id'])
                         self.progress.emit(0, 1, f"Removing: {r['name']}")
                         locs = device.get_case_track_locations(r["device_case_id"])
-                        device.remove_playlist(r["device_case_id"], list(locs))
+                        actually_deleted = device.remove_playlist(
+                            r["device_case_id"], list(locs)
+                        )
+                        _log.info("  Deleted %d track record(s) from DB", len(actually_deleted))
+                        deleted_locs.extend(actually_deleted)
                         self._sync_map.pop(str(r["editor_case_id"]), None)
                         removed += 1
+
+                _log.info("Device sync: deleting %d file(s) from device storage", len(deleted_locs))
+                self._delete_device_files(deleted_locs, self._device_db)
 
             # ── Phase 2: Push new checked cases to device ─────────────────
             total_tracks = sum(c.get("track_count", 0) for c in self._to_add)
 
             if self._to_add:
+                _log.info("Device sync: pushing %d case(s), %d tracks", len(self._to_add), total_tracks)
                 with PacemakerWriter(self._editor_db) as editor:
                     all_tracks = {
                         c["case_id"]: editor.get_case_tracks_as_trackinfo(c["case_id"])
@@ -321,6 +388,7 @@ class DeviceSyncWorker(QObject):
                                 f"Copying: {os.path.basename(track.location)}"
                             )
                             if not os.path.exists(track.location):
+                                _log.warning("  Track file not found, skipping: %s", track.location)
                                 skipped += 1
                                 done += 1
                                 continue
@@ -328,7 +396,9 @@ class DeviceSyncWorker(QObject):
                                 _win_dest, pmdb_loc = self._copy_track(
                                     track.location, self._device_db
                                 )
-                            except Exception:
+                                _log.debug("  Copied: %s -> %s", track.location, pmdb_loc)
+                            except Exception as _copy_err:
+                                _log.error("  Copy failed for %s: %s", track.location, _copy_err, exc_info=True)
                                 skipped += 1
                                 done += 1
                                 continue
@@ -351,9 +421,11 @@ class DeviceSyncWorker(QObject):
             if skipped:
                 parts.append(f"{skipped} track(s) skipped (file not found)")
             msg = ".  ".join(parts) + "." if parts else "Device already in sync."
+            _log.info("Device sync complete: %s", msg)
             self.finished.emit(True, msg)
 
         except Exception as e:
+            _log.error("Device sync error: %s", e, exc_info=True)
             self.finished.emit(False, str(e))
 
 
@@ -712,6 +784,7 @@ class MainWindow(QMainWindow):
         self._rb_reader: RekordboxReader | None = None
         self._playlist_nodes: list[PlaylistNode] = []
         self._sync_thread: QThread | None = None
+        self._sync_progress_dlg: QProgressDialog | None = None
         self._push_thread: QThread | None = None
         self._push_progress_dlg: QProgressDialog | None = None
 
@@ -757,11 +830,26 @@ class MainWindow(QMainWindow):
         repair_action.triggered.connect(self._open_repair_dialog)
         file_menu.addAction(repair_action)
 
+        cleanup_action = QAction("Clean Up Device Files…", self)
+        cleanup_action.triggered.connect(self._cleanup_orphaned_device_files)
+        file_menu.addAction(cleanup_action)
+
         file_menu.addSeparator()
 
         exit_action = QAction("Exit", self)
         exit_action.triggered.connect(self.close)
         file_menu.addAction(exit_action)
+
+        debug_menu = menu.addMenu("Debug")
+        self._debug_toggle = QAction("Enable Debug Logging", self)
+        self._debug_toggle.setCheckable(True)
+        self._debug_toggle.triggered.connect(self._toggle_debug_logging)
+        debug_menu.addAction(self._debug_toggle)
+
+        self._open_log_action = QAction("Open Log File…", self)
+        self._open_log_action.setEnabled(False)
+        self._open_log_action.triggered.connect(self._open_log_file)
+        debug_menu.addAction(self._open_log_action)
 
     def _build_ui(self):
         # ── Hidden state manager — not added to any layout ────────────────
@@ -781,12 +869,16 @@ class MainWindow(QMainWindow):
             show_checkboxes=True,
             show_tracklist=False,
             show_selection_size=True,
+            show_tabs=True,
         )
         self._editor_panel.refresh_requested.connect(self._load_editor_library)
         self._editor_panel.delete_requested.connect(self._on_delete_editor_case)
         self._editor_panel.rename_requested.connect(self._on_rename_editor_case)
+        self._editor_panel.inline_rename_committed.connect(self._on_inline_rename_editor_case)
         self._editor_panel.push_requested.connect(self._confirm_and_sync_to_device)
         self._editor_panel.case_selected.connect(self._on_editor_case_selected)
+        self._editor_panel.track_tab_play_requested.connect(self._on_track_tab_play)
+        self._editor_panel.track_tab_selected.connect(self._on_track_tab_selected)
 
         # ── Device library panel ──────────────────────────────────────────
         self._device_panel = PacemakerLibraryPanel(
@@ -796,6 +888,7 @@ class MainWindow(QMainWindow):
             show_eject=True,
             show_tracklist=False,
             show_storage=True,
+            show_tabs=True,
         )
         self._device_panel.refresh_requested.connect(self._load_device_library)
         self._device_panel.delete_requested.connect(self._on_delete_device_case)
@@ -820,8 +913,8 @@ class MainWindow(QMainWindow):
             f"QPushButton:disabled {{ background-color: #5a3010; color: #666666; }}"
         )
         import_btn = self._panel.sync_button
-        import_btn.setText("↓  Import from Rekordbox")
-        import_btn.setFixedHeight(34)
+        import_btn.setText("↓  Import to\nEditor Library")
+        import_btn.setFixedHeight(40)
         import_btn.setStyleSheet(_accent_ss_rb)
         import_btn.clicked.connect(self._confirm_and_sync)
 
@@ -986,7 +1079,7 @@ class MainWindow(QMainWindow):
             hh.setSectionResizeMode(col, mode)
         self._track_table.setColumnWidth(0, 36)
         self._track_table.setColumnWidth(1, 26)
-        self._track_table.setColumnWidth(2, 120)   # waveform preview
+        self._track_table.setColumnWidth(2, 160)   # waveform preview
         self._track_table.setColumnWidth(5, 52)
         self._track_table.setColumnWidth(6, 58)
         self._track_table.setColumnWidth(7, 56)
@@ -1000,7 +1093,9 @@ class MainWindow(QMainWindow):
         self._track_table.verticalHeader().setVisible(False)
         self._track_table.setAlternatingRowColors(True)
         self._track_table.setSortingEnabled(True)
+        self._track_table.sortByColumn(0, Qt.SortOrder.AscendingOrder)
         self._track_table.verticalHeader().setDefaultSectionSize(22)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)   # lock waveform col
         self._track_table.itemDoubleClicked.connect(self._on_track_double_clicked)
         self._track_table.viewport().installEventFilter(self)
 
@@ -1047,12 +1142,15 @@ class MainWindow(QMainWindow):
 
     def _load_rekordbox(self):
         try:
+            _logger.log.info("Loading Rekordbox library…")
             self._rb_reader = RekordboxReader()
             self._playlist_nodes = self._rb_reader.get_playlist_tree()
             self._refresh_tree()
             self._player_bar.set_rekordbox_reader(self._rb_reader)
+            _logger.log.info("Rekordbox library loaded — %d top-level nodes", len(self._playlist_nodes))
             self.statusBar().showMessage("Rekordbox library loaded.")
         except Exception as e:
+            _logger.log.error("Could not load Rekordbox: %s", e, exc_info=True)
             self.statusBar().showMessage(f"Could not load Rekordbox: {e}")
             QMessageBox.warning(
                 self, "Rekordbox Not Found",
@@ -1200,8 +1298,15 @@ class MainWindow(QMainWindow):
 
     def _run_sync(self, db_path: str, operations: list[dict]):
         total_tracks = sum(len(op["tracks"]) for op in operations)
-        self._panel.set_syncing(True)
-        self._panel.set_progress(0, max(total_tracks, 1), "Starting…")
+
+        self._sync_progress_dlg = QProgressDialog(
+            "Importing track 0 of 0…", None, 0, max(total_tracks, 1), self
+        )
+        self._sync_progress_dlg.setWindowTitle("Import to Editor Library")
+        self._sync_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._sync_progress_dlg.setMinimumDuration(0)
+        self._sync_progress_dlg.setValue(0)
+        self._sync_progress_dlg.show()
 
         self._sync_thread = QThread()
         self._worker = SyncWorker(db_path, operations)
@@ -1215,18 +1320,23 @@ class MainWindow(QMainWindow):
         self._sync_thread.start()
 
     def _on_sync_progress(self, current: int, total: int, status: str):
-        self._panel.set_progress(current, total, status)
+        dlg = self._sync_progress_dlg
+        if dlg is not None:
+            dlg.setValue(current)
+            dlg.setLabelText(f"Importing track {current} of {total}…")
 
     def _on_sync_finished(self, success: bool, message: str):
-        self._panel.set_syncing(False)
-        self._panel.reset_progress()
+        if self._sync_progress_dlg:
+            self._sync_progress_dlg.close()
+            self._sync_progress_dlg = None
 
         if success:
-            QMessageBox.information(self, "Sync Complete", message)
-            self._tree.uncheck_all()   # clears checked state; _recompute_queue fires via signal
+            _logger.log.info("Import to editor finished: %s", message)
+            self._tree.uncheck_all()
             self._load_editor_library()
         else:
-            QMessageBox.critical(self, "Sync Failed", f"An error occurred:\n\n{message}")
+            _logger.log.error("Import to editor failed: %s", message)
+            QMessageBox.critical(self, "Import Failed", f"An error occurred:\n\n{message}")
 
         self.statusBar().showMessage(message)
 
@@ -1280,7 +1390,17 @@ class MainWindow(QMainWindow):
         ]
 
         if not to_add and not to_remove:
-            self.statusBar().showMessage("Device already in sync with checked cases.")
+            # Count unsynced cases the user hasn't checked yet
+            unsynced_unchecked = [
+                eid for eid in editor_case_by_id
+                if eid not in synced_editor_ids and eid not in checked_ids
+            ]
+            hint = (
+                f"  ({len(unsynced_unchecked)} unchecked case{'s' if len(unsynced_unchecked) != 1 else ''}"
+                f" not yet on device — check them and sync again)"
+                if unsynced_unchecked else ""
+            )
+            self.statusBar().showMessage(f"Device already in sync with checked cases.{hint}")
             return
 
         self._run_device_sync(editor_db, device_db, to_add, to_remove, sync_map)
@@ -1328,7 +1448,6 @@ class MainWindow(QMainWindow):
 
         if success:
             self._play_completion_sound()
-            QMessageBox.information(self, "Sync Complete", message)
             self._load_device_library()
             self._apply_device_sync_state()
         else:
@@ -1367,7 +1486,13 @@ class MainWindow(QMainWindow):
         self._recompute_queue()
         self._load_editor_library()
 
-    def _load_editor_library(self):
+    def _load_editor_library(self, preserve_checked: bool = True):
+        # Save current selections before rebuilding the list so that refreshes
+        # triggered by renames, imports, etc. don't wipe the user's checkbox state.
+        currently_checked = (
+            {c["case_id"] for c in self._editor_panel.get_checked_cases()}
+            if preserve_checked else set()
+        )
         db_path = self._panel.db_path
         if not db_path:
             self._editor_panel.clear()
@@ -1375,12 +1500,14 @@ class MainWindow(QMainWindow):
         try:
             with PacemakerWriter(db_path) as writer:
                 cases = writer.get_all_cases()
+                all_tracks = writer.get_all_tracks_with_case_count()
             self._editor_panel.load_cases(cases, set())
+            self._editor_panel.load_all_device_tracks(all_tracks)
         except Exception as e:
             self._editor_panel.clear()
             self.statusBar().showMessage(f"Could not read Editor library: {e}")
             return
-        self._apply_device_sync_state()
+        self._apply_device_sync_state(extra_checked=currently_checked)
 
     def _on_editor_case_selected(self, case_id: int) -> None:
         """Load Editor case tracks into the central track table."""
@@ -1468,20 +1595,49 @@ class MainWindow(QMainWindow):
             self._start_waveform_batch([t.location for t in tracks])
 
     def _start_waveform_batch(self, locations: list[str]) -> None:
-        self._wave_thread = QThread()
-        self._wave_worker = _WaveformBatchWorker(self._rb_reader, locations)
-        self._wave_worker.moveToThread(self._wave_thread)
-        self._wave_thread.started.connect(self._wave_worker.run)
-        self._wave_worker.row_done.connect(self._on_wave_row_done)
-        self._wave_worker.finished.connect(self._wave_thread.quit)
-        self._wave_thread.start()
+        # Increment generation so any in-flight results from the previous batch
+        # are silently discarded by _on_wave_row_done.
+        self._wave_generation = getattr(self, "_wave_generation", 0) + 1
+        gen = self._wave_generation
 
-    def _on_wave_row_done(self, row: int, data) -> None:
+        # Cancel previous worker (sets a flag; it will finish soon)
+        if hasattr(self, "_wave_worker") and self._wave_worker:
+            self._wave_worker.cancel()
+            self._wave_worker = None
+
+        # Keep a list of all in-flight (thread, worker) pairs so Python's GC
+        # cannot collect them while the C++ thread is still running.
+        if not hasattr(self, "_wave_threads"):
+            self._wave_threads: list = []
+
+        thread = QThread()
+        worker = _WaveformBatchWorker(gen, locations)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.row_done.connect(self._on_wave_row_done)
+        worker.finished.connect(thread.quit)
+
+        def _cleanup(t=thread, w=worker):
+            try:
+                self._wave_threads.remove((t, w))
+            except ValueError:
+                pass
+
+        thread.finished.connect(_cleanup)
+        self._wave_threads.append((thread, worker))
+
+        self._wave_thread = thread
+        self._wave_worker = worker
+        thread.start()
+
+    def _on_wave_row_done(self, generation: int, row: int, data) -> None:
+        # Ignore results from a cancelled/superseded batch
+        if generation != getattr(self, "_wave_generation", 0):
+            return
         if row < self._track_table.rowCount():
             item = self._track_table.item(row, 2)
             if item and data:
                 item.setData(_WAVE_COL_ROLE, data)
-                # Force repaint of this cell
                 self._track_table.update(
                     self._track_table.model().index(row, 2)
                 )
@@ -1646,6 +1802,61 @@ class MainWindow(QMainWindow):
 
         self._load_editor_library()
 
+    def _on_inline_rename_editor_case(self, case_id: int, new_name: str) -> None:
+        """Handle an inline (double-click) rename committed directly in the list."""
+        db_path = self._panel.db_path
+        if not db_path:
+            return
+        try:
+            with PacemakerWriter(db_path) as writer:
+                writer.rename_case(case_id, new_name)
+            _logger.log.info("Renamed editor case %d to %r (inline)", case_id, new_name)
+            self.statusBar().showMessage(f'Renamed to "{new_name}".')
+            self._load_editor_library()
+        except Exception as e:
+            _logger.log.error("Inline rename failed: %s", e, exc_info=True)
+            QMessageBox.critical(self, "Rename Failed", str(e))
+
+    def _on_track_tab_play(self, track_dict: dict) -> None:
+        """Play a track selected by double-click in the editor Tracks tab."""
+        location = track_dict.get("location") or ""
+        if not location or not os.path.exists(location):
+            self.statusBar().showMessage(f"File not found: {location}")
+            return
+        track = TrackInfo(
+            location=location,
+            title=track_dict.get("title") or "",
+            artist=track_dict.get("artist") or "",
+            album="", album_artist="", composer="", genre="",
+            label="", producer="", remixer="", key="",
+            year="", comments="",
+            bpm=float(track_dict.get("bpm") or 0),
+            rating=int(track_dict.get("rating") or 0),
+            track_number=0, number_of_tracks=0,
+            disc_number=0, number_of_discs=0,
+            bit_rate=int(track_dict.get("bit_rate") or 0),
+            sample_rate=int(track_dict.get("sample_rate") or 0),
+            play_time_secs=int(track_dict.get("play_time_secs") or 0),
+            file_size=int(track_dict.get("file_size") or 0),
+            format=track_dict.get("format") or "",
+        )
+        self._player_bar.load_and_play([track], 0)
+
+    def _on_track_tab_selected(self, track_id: int) -> None:
+        """Show which cases contain the selected track in the Tracks tab banner."""
+        if track_id == -1:
+            self._editor_panel.set_track_cases_banner([])
+            return
+        db_path = self._panel.db_path
+        if not db_path:
+            return
+        try:
+            with PacemakerWriter(db_path) as writer:
+                names = writer.get_cases_for_track(track_id)
+            self._editor_panel.set_track_cases_banner(names)
+        except Exception:
+            self._editor_panel.set_track_cases_banner([])
+
     # ------------------------------------------------------------------
     # Device library panel
     # ------------------------------------------------------------------
@@ -1671,7 +1882,9 @@ class MainWindow(QMainWindow):
         try:
             with PacemakerWriter(db_path) as writer:
                 cases = writer.get_all_cases()
+                all_tracks = writer.get_all_tracks_with_case_count()
             self._device_panel.load_cases(cases, set())
+            self._device_panel.load_all_device_tracks(all_tracks)
         except Exception as e:
             self._device_panel.clear()
             self.statusBar().showMessage(f"Could not read Device library: {e}")
@@ -1699,14 +1912,21 @@ class MainWindow(QMainWindow):
 
         self._device_panel.set_storage_info(used, total)
 
-    def _apply_device_sync_state(self) -> None:
-        """Read sync map from device and check the corresponding Editor cases."""
+    def _apply_device_sync_state(self, extra_checked: "set[int] | None" = None) -> None:
+        """Read sync map from device and check the corresponding Editor cases.
+
+        extra_checked: additional case IDs to keep checked (preserves user selections
+        across library refreshes; ignored when None so callers can do a clean reset).
+        """
         device_db = self._device_panel.db_path
         if not device_db or not self._panel.db_path:
+            if extra_checked:
+                self._editor_panel.set_checked_cases(extra_checked)
             return
         sync_map = _read_sync_map(device_db)
         synced_editor_ids = {int(k) for k in sync_map}
-        self._editor_panel.set_checked_cases(synced_editor_ids)
+        checked = synced_editor_ids | (extra_checked or set())
+        self._editor_panel.set_checked_cases(checked)
         self._editor_panel.push_button.setEnabled(True)
 
     def _on_delete_device_case(self, cases: list):
@@ -1842,8 +2062,7 @@ class MainWindow(QMainWindow):
         if len(cases) == 1:
             detail = f"\"{cases[0]['name']}\""
         else:
-            names = "\n".join(f"  • {c['name']}" for c in cases)
-            detail = f"{len(cases)} cases:\n{names}"
+            detail = f"{len(cases)} cases"
 
         reply = QMessageBox.question(
             self, "Delete Case" if len(cases) == 1 else "Delete Cases",
@@ -1855,10 +2074,16 @@ class MainWindow(QMainWindow):
             return
 
         try:
+            deleted_locs: list[str] = []
             with PacemakerWriter(db_path) as writer:
                 for case in cases:
                     locations = list(writer.get_case_track_locations(case["case_id"]))
-                    writer.remove_playlist(case["case_id"], locations)
+                    actually_deleted = writer.remove_playlist(case["case_id"], locations)
+                    deleted_locs.extend(actually_deleted)
+
+            # If deleting from the device DB, remove the audio files too
+            if db_path == self._device_panel.db_path and deleted_locs:
+                DeviceSyncWorker._delete_device_files(deleted_locs, db_path)
 
             if update_sync_state:
                 state = sync_state.load(db_path)
@@ -1878,6 +2103,157 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Repair device DB
     # ------------------------------------------------------------------
+
+    def _cleanup_orphaned_device_files(self):
+        """Delete audio files in J:\\.Pacemaker\\Music\\ not referenced in the device DB."""
+        device_db = self._device_panel.db_path
+        if not device_db:
+            QMessageBox.warning(self, "No Device", "No device database loaded.")
+            return
+
+        device_drive = os.path.splitdrive(device_db)[0]
+        music_root = os.path.join(device_drive, os.sep, ".Pacemaker", "Music")
+        if not os.path.isdir(music_root):
+            QMessageBox.information(self, "Clean Up", "No Music folder found on device.")
+            return
+
+        try:
+            with PacemakerWriter(device_db) as writer:
+                db_tracks = writer.get_all_tracks_with_case_count()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return
+        db_locations = {t["location"] for t in db_tracks}
+
+        _AUDIO_EXTS = {".mp3", ".flac", ".aac", ".m4a", ".mp4", ".wav", ".aiff", ".ogg"}
+
+        to_delete: list[str] = []
+        for dirpath, _dirs, files in os.walk(music_root):
+            for fname in files:
+                if os.path.splitext(fname)[1].lower() not in _AUDIO_EXTS:
+                    continue
+                full = os.path.join(dirpath, fname)
+                rel = full[len(music_root):].lstrip(os.sep).replace(os.sep, "/")
+                if f"/pmdb_tracks/{rel}" not in db_locations:
+                    to_delete.append(full)
+
+        if not to_delete:
+            QMessageBox.information(self, "Clean Up", "No orphaned audio files found — device is clean.")
+            return
+
+        total_size = sum(os.path.getsize(p) for p in to_delete if os.path.exists(p))
+        reply = QMessageBox.question(
+            self, "Clean Up Orphaned Files",
+            f"Found {len(to_delete)} audio file(s) on the device not in the database.\n"
+            f"Total size: {total_size / 1_000_000_000:.2f} GB\n\n"
+            "Permanently delete these files?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        # Run deletion in a background thread with a progress dialog
+        progress = QProgressDialog(
+            "Deleting orphaned files…", "Cancel", 0, len(to_delete), self
+        )
+        progress.setWindowTitle("Clean Up Device Files")
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+
+        class _CleanupWorker(QObject):
+            file_done = pyqtSignal(int, int)      # deleted_count, freed_bytes
+            finished  = pyqtSignal(int, int)      # total_deleted, total_freed
+
+            def __init__(self, paths: list):
+                super().__init__()
+                self._paths = paths
+                self._cancelled = False
+
+            def cancel(self) -> None:
+                self._cancelled = True
+
+            def run(self) -> None:
+                deleted = freed = 0
+                for i, path in enumerate(self._paths):
+                    if self._cancelled:
+                        break
+                    try:
+                        freed += os.path.getsize(path) if os.path.exists(path) else 0
+                        os.remove(path)
+                        deleted += 1
+                        str_path = os.path.splitext(path)[0] + ".str"
+                        if os.path.exists(str_path):
+                            os.remove(str_path)
+                    except Exception:
+                        pass
+                    self.file_done.emit(i + 1, freed)
+                self.finished.emit(deleted, freed)
+
+        thread = QThread(self)
+        worker = _CleanupWorker(to_delete)
+        worker.moveToThread(thread)
+
+        def on_file_done(done: int, freed: int) -> None:
+            if progress.wasCanceled():
+                worker.cancel()
+                return
+            progress.setValue(done)
+            progress.setLabelText(
+                f"Deleting file {done} of {len(to_delete)}… "
+                f"({freed / 1_000_000_000:.2f} GB freed)"
+            )
+
+        def on_finished(deleted: int, freed: int) -> None:
+            progress.close()
+            thread.quit()
+            self._load_device_storage()
+            QMessageBox.information(
+                self, "Clean Up Complete",
+                f"Deleted {deleted} file(s) and freed {freed / 1_000_000_000:.2f} GB.",
+            )
+
+        thread.started.connect(worker.run)
+        worker.file_done.connect(on_file_done)
+        worker.finished.connect(on_finished)
+        progress.canceled.connect(worker.cancel)
+        thread.start()
+
+    # ------------------------------------------------------------------
+    # Debug logging
+    # ------------------------------------------------------------------
+
+    def _toggle_debug_logging(self, checked: bool) -> None:
+        if checked:
+            editor_db = self._panel.db_path
+            if editor_db:
+                log_dir = os.path.dirname(editor_db)
+            else:
+                log_dir = os.path.expandvars(r"%APPDATA%\Tonium\Pacemaker")
+            log_path = os.path.join(log_dir, "rb_pm_sync.log")
+            _logger.enable(log_path)
+            self._open_log_action.setEnabled(True)
+            self.statusBar().showMessage(f"Debug logging enabled → {log_path}")
+            _logger.log.info("App version: rekordbox-pacemaker-sync")
+            _logger.log.info("Editor DB: %s", self._panel.db_path or "none")
+            _logger.log.info("Device DB: %s", self._device_panel.db_path or "none")
+        else:
+            _logger.disable()
+            self._open_log_action.setEnabled(False)
+            self.statusBar().showMessage("Debug logging disabled.")
+
+    def _open_log_file(self) -> None:
+        from PyQt6.QtCore import QUrl
+        from PyQt6.QtGui import QDesktopServices
+        editor_db = self._panel.db_path
+        log_dir = os.path.dirname(editor_db) if editor_db else os.path.expandvars(
+            r"%APPDATA%\Tonium\Pacemaker"
+        )
+        log_path = os.path.join(log_dir, "rb_pm_sync.log")
+        if os.path.exists(log_path):
+            QDesktopServices.openUrl(QUrl.fromLocalFile(log_path))
+        else:
+            QMessageBox.information(self, "Log File", f"Log file not found:\n{log_path}")
 
     def _open_repair_dialog(self):
         dlg = RepairDeviceDbDialog(self._device_panel.db_path, self)

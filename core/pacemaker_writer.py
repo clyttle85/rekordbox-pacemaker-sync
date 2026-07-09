@@ -152,11 +152,13 @@ class PacemakerWriter:
         )
         self._conn.commit()
 
-    def delete_orphan_tracks(self, locations: list[str]) -> None:
+    def delete_orphan_tracks(self, locations: list[str]) -> list[str]:
         """
         Delete tracks at the given locations only if they are not
         referenced by any other case.
+        Returns the list of locations that were actually deleted.
         """
+        deleted: list[str] = []
         cursor = self._conn.cursor()
         for loc in locations:
             cursor.execute("SELECT track_id FROM tracks WHERE location = ?", (loc,))
@@ -169,7 +171,9 @@ class PacemakerWriter:
             )
             if cursor.fetchone()[0] == 0:
                 cursor.execute("DELETE FROM tracks WHERE track_id = ?", (track_id,))
+                deleted.append(loc)
         self._conn.commit()
+        return deleted
 
     # ------------------------------------------------------------------
     # High-level sync operations
@@ -223,12 +227,13 @@ class PacemakerWriter:
                 progress_callback(i + 1, len(tracks))
         return case_id, locations
 
-    def remove_playlist(self, case_id: int, track_locations: list[str]) -> None:
+    def remove_playlist(self, case_id: int, track_locations: list[str]) -> list[str]:
         """
         Delete a case and remove any tracks that are now orphaned.
+        Returns the list of track locations that were actually deleted from the DB.
         """
         self.delete_case(case_id)
-        self.delete_orphan_tracks(track_locations)
+        return self.delete_orphan_tracks(track_locations)
 
     # ------------------------------------------------------------------
     # Read operations
@@ -319,6 +324,34 @@ class PacemakerWriter:
             }
             for row in cursor.fetchall()
         ]
+
+    def get_cases_for_track(self, track_id: int) -> list[str]:
+        """Return the names of all cases that contain this track."""
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT c.name FROM cases c
+            JOIN casetracks ct ON ct.case_id = c.case_id
+            WHERE ct.track_id = ?
+            ORDER BY c.name COLLATE NOCASE
+        """, (track_id,))
+        return [row["name"] for row in cursor.fetchall()]
+
+    def get_all_tracks_with_case_count(self) -> list[dict]:
+        """
+        Return every track in the DB with how many cases reference it.
+        case_count == 0 means the track is orphaned (in tracks table but no case).
+        """
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT t.track_id, t.title, t.artist, t.bpm, t.play_time_secs,
+                   t.location, t.file_size,
+                   COUNT(ct.case_id) AS case_count
+            FROM tracks t
+            LEFT JOIN casetracks ct ON ct.track_id = t.track_id
+            GROUP BY t.track_id
+            ORDER BY t.title COLLATE NOCASE
+        """)
+        return [dict(row) for row in cursor.fetchall()]
 
     def fix_bpm_values(self) -> int:
         """

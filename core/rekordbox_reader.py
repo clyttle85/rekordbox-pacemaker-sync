@@ -183,10 +183,14 @@ class RekordboxReader:
         if pl is None:
             return []
 
-        contents_result = self._db.get_playlist_contents(pl)
-        contents = contents_result.all() if hasattr(contents_result, "all") else contents_result
+        # get_playlist_contents() loses track order — it uses ID.in_() with no ORDER BY.
+        # pl.Songs is the DjmdSongPlaylist join table which has TrackNo for ordering.
+        songs = sorted(pl.Songs or [], key=lambda s: s.TrackNo or 0)
         tracks = []
-        for content in contents:
+        for song in songs:
+            content = song.Content
+            if content is None:
+                continue
             if not content.FolderPath:
                 continue
 

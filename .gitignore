@@ -23,9 +23,14 @@ env/
 # Sync state — user-specific, generated at runtime
 rb_pacemaker_sync_state.json
 
-# PyInstaller / packaging
+# PyInstaller / packaging — the top-level build spec is tracked (it has
+# hand-tuned hiddenimports/icon config), stray/auto-generated ones are not
 *.spec
+!/rekordbox_pacemaker_sync.spec
 *.manifest
+
+# Inno Setup installer output
+*.exe
 
 # IDE / OS
 .vscode/
@@ -36,3 +41,8 @@ Thumbs.db
 
 # Logs
 *.log
+
+# Test/type-checker caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

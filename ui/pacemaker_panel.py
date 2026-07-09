@@ -10,9 +10,9 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QPushButton, QFrame,
     QFileDialog, QSizePolicy, QSplitter, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QProgressBar,
+    QProgressBar, QTabWidget,
 )
-from PyQt6.QtCore import Qt, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QPainter, QPen
 
 
@@ -41,14 +41,17 @@ def _fmt_bytes(b: int) -> str:
 class PacemakerLibraryPanel(QWidget):
     """Displays cases in a Pacemaker music.db and exposes actions as signals."""
 
-    delete_requested = pyqtSignal(list)   # list of {"case_id": int, "name": str}
-    rename_requested = pyqtSignal(list)   # list of {"case_id": int, "name": str}
+    delete_requested = pyqtSignal(list)        # list of {"case_id": int, "name": str}
+    rename_requested = pyqtSignal(list)        # list of {"case_id": int, "name": str}  (Rename button)
+    inline_rename_committed = pyqtSignal(int, str)  # (case_id, new_name) — double-click inline edit
     eject_requested  = pyqtSignal()
     refresh_requested = pyqtSignal()
-    push_requested = pyqtSignal()         # Editor → Device
-    db_path_changed = pyqtSignal(str)     # emitted when Browse is used
-    case_selected = pyqtSignal(int)       # case_id, or -1 when nothing selected
+    push_requested = pyqtSignal()              # Editor → Device
+    db_path_changed = pyqtSignal(str)          # emitted when Browse is used
+    case_selected = pyqtSignal(int)            # case_id, or -1 when nothing selected
     play_track_requested = pyqtSignal(list, int)  # (list[TrackInfo], start_index)
+    track_tab_play_requested = pyqtSignal(dict)   # track dict — double-click in Tracks tab
+    track_tab_selected = pyqtSignal(int)          # track_id selected in Tracks tab (-1 = none)
 
     def __init__(
         self,
@@ -59,8 +62,9 @@ class PacemakerLibraryPanel(QWidget):
         show_checkboxes: bool = False,
         show_eject: bool = False,
         show_tracklist: bool = False,
-        show_storage: bool = False,      # Device panel: used/total bar
-        show_selection_size: bool = False,  # Editor panel: selected cases size
+        show_storage: bool = False,
+        show_selection_size: bool = False,
+        show_tabs: bool = False,          # Device panel: Cases + Tracks tabs
         parent=None,
     ):
         super().__init__(parent)
@@ -73,12 +77,17 @@ class PacemakerLibraryPanel(QWidget):
         self._show_tracklist = show_tracklist
         self._show_storage = show_storage
         self._show_selection_size = show_selection_size
+        self._show_tabs = show_tabs
         self._cases: list[dict] = []
         self._managed_case_ids: set[int] = set()
         self._db_path: str = ""
         self._current_tracks: list = []   # TrackInfo list for the selected case
         self._device_total_bytes: int = 0   # reported by set_storage_info()
         self._case_icon = _make_case_icon()
+        # Inline rename state
+        self._editing_item = None
+        self._editing_case_id: int = -1
+        self._editing_original_case_name: str = ""
         self._build_ui()
 
     # ------------------------------------------------------------------
@@ -154,13 +163,15 @@ class PacemakerLibraryPanel(QWidget):
         self._list.setIconSize(QSize(14, 12))
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
-        if self._show_checkboxes:
-            self._list.itemChanged.connect(self._on_check_changed)
+        # Unified handler covers both checkbox changes and inline text edits
+        self._list.itemChanged.connect(self._on_list_item_changed)
+        # Detect when an inline edit is cancelled (Escape) via the delegate signal
+        self._list.itemDelegate().closeEditor.connect(self._on_close_editor)
         if self._show_rename:
             self._list.itemDoubleClicked.connect(self._on_item_double_clicked)
 
         if self._show_tracklist:
-            # Build track list table
+            # Case list + per-case track list split view
             self._track_table = QTableWidget(0, 5)
             self._track_table.setHorizontalHeaderLabels(["#", "Title", "Artist", "Time", "BPM"])
             self._track_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Fixed)
@@ -183,8 +194,19 @@ class PacemakerLibraryPanel(QWidget):
             splitter.addWidget(self._track_table)
             splitter.setSizes([180, 220])
             layout.addWidget(splitter, stretch=1)
+
+        elif self._show_tabs:
+            # Cases tab + all-tracks tab
+            tracks_tab_widget = self._build_all_tracks_tab()
+            self._tab_widget = QTabWidget()
+            self._tab_widget.addTab(self._list, "Cases")
+            self._tab_widget.addTab(tracks_tab_widget, "Tracks")
+            self._track_table = None
+            layout.addWidget(self._tab_widget, stretch=1)
+
         else:
             self._track_table = None
+            self._all_tracks_table = None
             layout.addWidget(self._list, stretch=1)
 
         # Legend
@@ -225,6 +247,99 @@ class PacemakerLibraryPanel(QWidget):
         self._delete_btn.clicked.connect(self._on_delete_clicked)
         btn_row.addWidget(self._delete_btn)
         layout.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    # All-tracks table (Tracks tab)
+    # ------------------------------------------------------------------
+
+    def _build_all_tracks_tab(self) -> QWidget:
+        """Build the Tracks tab: a cases banner above the track table."""
+        container = QWidget()
+        vbox = QVBoxLayout(container)
+        vbox.setContentsMargins(0, 0, 0, 0)
+        vbox.setSpacing(2)
+
+        # Banner: shows which cases the selected track appears in
+        self._track_cases_banner = QLabel("")
+        self._track_cases_banner.setStyleSheet(
+            "font-size: 10px; color: #aaaaaa; padding: 2px 4px;"
+            "background: #252525; border-bottom: 1px solid #333;"
+        )
+        self._track_cases_banner.setWordWrap(True)
+        self._track_cases_banner.setVisible(False)
+        vbox.addWidget(self._track_cases_banner)
+
+        # Track table
+        t = QTableWidget(0, 5)
+        t.setHorizontalHeaderLabels(["Title", "Artist", "BPM", "Time", "Cases"])
+        hh = t.horizontalHeader()
+        hh.setSectionResizeMode(0, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(1, QHeaderView.ResizeMode.Interactive)
+        hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(3, QHeaderView.ResizeMode.Fixed)
+        hh.setSectionResizeMode(4, QHeaderView.ResizeMode.Fixed)
+        t.setColumnWidth(0, 200)
+        t.setColumnWidth(1, 160)
+        t.setColumnWidth(2, 40)
+        t.setColumnWidth(3, 44)
+        t.setColumnWidth(4, 36)
+        t.setHorizontalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        t.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        t.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        t.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        t.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        t.verticalHeader().setVisible(False)
+        t.verticalHeader().setDefaultSectionSize(22)
+        t.setAlternatingRowColors(True)
+        t.setSortingEnabled(True)
+        t.itemDoubleClicked.connect(self._on_track_tab_double_clicked)
+        t.itemSelectionChanged.connect(self._on_track_tab_selection_changed)
+        self._all_tracks_table = t
+        vbox.addWidget(t, stretch=1)
+        return container
+
+    def load_all_device_tracks(self, tracks: "list[dict]") -> None:
+        """Populate the Tracks tab. tracks is from get_all_tracks_with_case_count()."""
+        if not self._show_tabs or self._all_tracks_table is None:
+            return
+        tbl = self._all_tracks_table
+        tbl.setSortingEnabled(False)
+        tbl.setRowCount(0)
+        orphan_color = QColor("#888888")
+        for i, t in enumerate(tracks):
+            tbl.insertRow(i)
+            secs = int(t.get("play_time_secs") or 0)
+            duration = f"{secs // 60}:{secs % 60:02d}"
+            bpm_val = int(t.get("bpm") or 0)
+            if bpm_val > 1000:
+                bpm_val = round(bpm_val / 100)
+            bpm = str(bpm_val) if bpm_val else ""
+            case_count = int(t.get("case_count") or 0)
+            is_orphan = case_count == 0
+            for col, val in enumerate([
+                t.get("title") or "",
+                t.get("artist") or "",
+                bpm,
+                duration,
+                str(case_count),
+            ]):
+                item = QTableWidgetItem(val)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if is_orphan:
+                    item.setForeground(orphan_color)
+                if col in (2, 3, 4):
+                    item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
+                # Store the full track dict in col-0 item for use on selection/dblclick
+                if col == 0:
+                    item.setData(Qt.ItemDataRole.UserRole, t)
+                tbl.setItem(i, col, item)
+        tbl.setSortingEnabled(True)
+        # Update tab label with count
+        orphan_count = sum(1 for t in tracks if int(t.get("case_count") or 0) == 0)
+        label = f"Tracks ({len(tracks)})"
+        if orphan_count:
+            label += f"  ·  {orphan_count} orphaned"
+        self._tab_widget.setTabText(1, label)
 
     # ------------------------------------------------------------------
     # Public interface
@@ -294,6 +409,8 @@ class PacemakerLibraryPanel(QWidget):
 
         count = len(cases)
         self._count_label.setText(f"{count} case{'s' if count != 1 else ''} on device.")
+        if self._show_tabs:
+            self._tab_widget.setTabText(0, f"Cases ({count})")
         self._delete_btn.setEnabled(False)
         self._delete_btn.setText("Delete")
 
@@ -393,10 +510,59 @@ class PacemakerLibraryPanel(QWidget):
         if self._show_selection_size:
             self._update_selection_size()
 
-    def _on_check_changed(self, item: "QListWidgetItem") -> None:
-        """Push button state is managed externally; we just update the selection size label."""
+    def _on_list_item_changed(self, item: "QListWidgetItem") -> None:
+        """Unified itemChanged handler: covers inline text edits and checkbox changes."""
+        if self._editing_item is item:
+            # User committed an inline rename
+            new_name = item.text().strip()
+            self._finish_inline_edit(new_name, committed=True)
+            return
+        # Otherwise it's a checkbox state change
         if self._show_selection_size:
             self._update_selection_size()
+
+    def _finish_inline_edit(self, new_name: str, committed: bool) -> None:
+        if self._editing_item is None:
+            return
+        item = self._editing_item
+        case_id = self._editing_case_id
+        original_name = self._editing_original_case_name
+        self._editing_item = None
+        item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+        if committed and new_name and new_name != original_name:
+            # Update local copy so the restored text uses the new name
+            for c in self._cases:
+                if c["case_id"] == case_id:
+                    c["name"] = new_name
+                    break
+            self._restore_item_formatted_text(item, case_id)
+            self.inline_rename_committed.emit(case_id, new_name)
+        else:
+            self._restore_item_formatted_text(item, case_id)
+
+    def _restore_item_formatted_text(self, item: "QListWidgetItem", case_id: int) -> None:
+        case = next((c for c in self._cases if c["case_id"] == case_id), None)
+        if not case:
+            return
+        track_word = "track" if case["track_count"] == 1 else "tracks"
+        managed = case_id in self._managed_case_ids
+        self._list.blockSignals(True)
+        item.setText(f"  {case['name']}  ({case['track_count']} {track_word})")
+        if managed:
+            item.setForeground(QColor("#4caf50"))
+        self._list.blockSignals(False)
+
+    def _on_close_editor(self, editor, hint) -> None:
+        """Fires for both commit and cancel. If still in editing state after the
+        event loop ticks, itemChanged didn't fire → it was a cancel (Escape)."""
+        if self._editing_item is not None:
+            QTimer.singleShot(0, self._maybe_restore_after_cancel)
+
+    def _maybe_restore_after_cancel(self) -> None:
+        """Called one event-loop tick after closeEditor. If _editing_item is still
+        set, the edit was cancelled rather than committed."""
+        if self._editing_item is not None:
+            self._finish_inline_edit("", committed=False)
 
     def _update_selection_size(self) -> None:
         checked = self.get_checked_cases()
@@ -429,10 +595,18 @@ class PacemakerLibraryPanel(QWidget):
 
     def _on_item_double_clicked(self, item: "QListWidgetItem") -> None:
         case_id = item.data(Qt.ItemDataRole.UserRole)
-        for c in self._cases:
-            if c["case_id"] == case_id:
-                self.rename_requested.emit([c])
-                break
+        case = next((c for c in self._cases if c["case_id"] == case_id), None)
+        if not case:
+            return
+        self._editing_item = item
+        self._editing_case_id = case_id
+        self._editing_original_case_name = case["name"]
+        # Strip the " (N tracks)" suffix so the user only edits the name
+        self._list.blockSignals(True)
+        item.setText(case["name"])
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)
+        self._list.blockSignals(False)
+        self._list.editItem(item)
 
     def _on_rename_clicked(self):
         cases = self.selected_cases()
@@ -443,6 +617,40 @@ class PacemakerLibraryPanel(QWidget):
         cases = self.selected_cases()
         if cases:
             self.delete_requested.emit(cases)
+
+    def set_track_cases_banner(self, case_names: "list[str]") -> None:
+        """Update the 'In cases:' banner above the Tracks tab table."""
+        if not self._show_tabs or not hasattr(self, "_track_cases_banner"):
+            return
+        if case_names:
+            self._track_cases_banner.setText("In:  " + "  /  ".join(case_names))
+            self._track_cases_banner.setVisible(True)
+        else:
+            self._track_cases_banner.setText("")
+            self._track_cases_banner.setVisible(False)
+
+    def _on_track_tab_double_clicked(self, item: "QTableWidgetItem") -> None:
+        row = item.row()
+        col0 = self._all_tracks_table.item(row, 0)
+        if col0:
+            track_dict = col0.data(Qt.ItemDataRole.UserRole)
+            if track_dict:
+                self.track_tab_play_requested.emit(track_dict)
+
+    def _on_track_tab_selection_changed(self) -> None:
+        selected = self._all_tracks_table.selectedItems()
+        if not selected:
+            self.track_tab_selected.emit(-1)
+            return
+        row = selected[0].row()
+        col0 = self._all_tracks_table.item(row, 0)
+        if col0:
+            track_dict = col0.data(Qt.ItemDataRole.UserRole)
+            if track_dict:
+                track_id = int(track_dict.get("track_id") or -1)
+                self.track_tab_selected.emit(track_id)
+                return
+        self.track_tab_selected.emit(-1)
 
     def _browse_db(self):
         path, _ = QFileDialog.getOpenFileName(
