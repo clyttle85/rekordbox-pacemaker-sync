@@ -77,4 +77,3 @@ See [CLAUDE.md](CLAUDE.md) for a full technical deep-dive (database schemas, syn
 - Windows installer distribution — packaging the app as a proper installable Windows application (beyond the current manual PyInstaller/Inno Setup steps) so it can be installed and updated without a Python environment.
 - Split `disc_number` / `number_of_discs` correctly in `m3u8_reader.py` (currently both read from the same tag)
 - Batch DB transactions in `pacemaker_writer.py` for large syncs
-- Automated test suite
