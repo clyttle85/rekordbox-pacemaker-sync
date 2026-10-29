@@ -239,6 +239,36 @@ class PacemakerWriter:
     # Read operations
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _row_to_trackinfo(row: sqlite3.Row) -> TrackInfo:
+        """Build a TrackInfo from a `tracks` table row (requires SELECT t.*)."""
+        return TrackInfo(
+            location=row["location"] or "",
+            title=row["title"] or "",
+            artist=row["artist"] or "",
+            album=row["album"] or "",
+            album_artist=row["album_artist"] or "",
+            composer=row["composer"] or "",
+            genre=row["genre"] or "",
+            label=row["label"] or "",
+            producer=row["producer"] or "",
+            remixer=row["remixer"] or "",
+            key=row["key"] or "",
+            year=str(row["year"]) if row["year"] else "",
+            comments=row["comments"] or "",
+            bpm=row["bpm"] or 0,
+            rating=row["rating"] or 0,
+            track_number=row["track_number"] or 0,
+            number_of_tracks=row["number_of_tracks"] or 0,
+            disc_number=row["disc_number"] or 0,
+            number_of_discs=row["number_of_discs"] or 0,
+            bit_rate=row["bit_rate"] or 0,
+            sample_rate=row["sample_rate"] or 0,
+            play_time_secs=row["play_time_secs"] or 0,
+            file_size=row["file_size"] or 0,
+            format=row["format"] or "",
+        )
+
     def get_case_tracks_as_trackinfo(self, case_id: int) -> list[TrackInfo]:
         """
         Read all tracks for a case from this DB and return them as TrackInfo objects.
@@ -252,35 +282,66 @@ class PacemakerWriter:
             WHERE ct.case_id = ?
             ORDER BY ct.rowid
         """, (case_id,))
-        tracks = []
-        for row in cursor.fetchall():
-            tracks.append(TrackInfo(
-                location=row["location"] or "",
-                title=row["title"] or "",
-                artist=row["artist"] or "",
-                album=row["album"] or "",
-                album_artist=row["album_artist"] or "",
-                composer=row["composer"] or "",
-                genre=row["genre"] or "",
-                label=row["label"] or "",
-                producer=row["producer"] or "",
-                remixer=row["remixer"] or "",
-                key=row["key"] or "",
-                year=str(row["year"]) if row["year"] else "",
-                comments=row["comments"] or "",
-                bpm=row["bpm"] or 0,
-                rating=row["rating"] or 0,
-                track_number=row["track_number"] or 0,
-                number_of_tracks=row["number_of_tracks"] or 0,
-                disc_number=row["disc_number"] or 0,
-                number_of_discs=row["number_of_discs"] or 0,
-                bit_rate=row["bit_rate"] or 0,
-                sample_rate=row["sample_rate"] or 0,
-                play_time_secs=row["play_time_secs"] or 0,
-                file_size=row["file_size"] or 0,
-                format=row["format"] or "",
-            ))
-        return tracks
+        return [self._row_to_trackinfo(row) for row in cursor.fetchall()]
+
+    def get_all_tracks_as_trackinfo(self) -> list[tuple[TrackInfo, int]]:
+        """
+        Read every track in the database as (TrackInfo, case_count) pairs.
+        case_count == 0 means the track is orphaned (in no case).
+        Used for the Editor Library's whole-library "all tracks" view.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT t.*, COUNT(ct.case_id) AS case_count
+            FROM tracks t
+            LEFT JOIN casetracks ct ON ct.track_id = t.track_id
+            GROUP BY t.track_id
+            ORDER BY t.title COLLATE NOCASE
+        """)
+        return [
+            (self._row_to_trackinfo(row), row["case_count"])
+            for row in cursor.fetchall()
+        ]
+
+    def get_track_id_by_location(self, location: str) -> Optional[int]:
+        """Return the track_id for a track at this file location, or None."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT track_id FROM tracks WHERE location = ?", (location,))
+        row = cursor.fetchone()
+        return row["track_id"] if row else None
+
+    def is_track_in_case(self, case_id: int, track_id: int) -> bool:
+        """Return True if this track is already linked to this case."""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "SELECT 1 FROM casetracks WHERE case_id = ? AND track_id = ? LIMIT 1",
+            (case_id, track_id)
+        )
+        return cursor.fetchone() is not None
+
+    def unlink_track_from_case(self, case_id: int, track_id: int) -> None:
+        """Remove a single track from a case without deleting the track itself."""
+        cursor = self._conn.cursor()
+        cursor.execute(
+            "DELETE FROM casetracks WHERE case_id = ? AND track_id = ?",
+            (case_id, track_id)
+        )
+        self._conn.commit()
+
+    def reorder_case_tracks(self, case_id: int, track_ids_in_order: list[int]) -> None:
+        """
+        Rewrite a case's track order to match the given sequence of track_ids
+        (order is implied by casetracks insertion order — see
+        get_case_tracks_as_trackinfo's `ORDER BY ct.rowid`). Does not change
+        which tracks are in the case, only their order.
+        """
+        cursor = self._conn.cursor()
+        cursor.execute("DELETE FROM casetracks WHERE case_id = ?", (case_id,))
+        cursor.executemany(
+            "INSERT INTO casetracks (case_id, track_id) VALUES (?, ?)",
+            [(case_id, track_id) for track_id in track_ids_in_order]
+        )
+        self._conn.commit()
 
     def find_track_id(self, track: TrackInfo) -> Optional[int]:
         """

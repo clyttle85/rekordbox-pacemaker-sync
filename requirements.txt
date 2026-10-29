@@ -1,5 +1,8 @@
 PyQt6>=6.4.0
 pyrekordbox>=0.3.0
 mutagen>=1.47.0
-sqlcipher3-wheels
 sqlalchemy>=2.0.0
+
+# SQLCipher support for reading Rekordbox's encrypted master.db — the install
+# path differs per OS, see README.md's Setup section.
+sqlcipher3-wheels; sys_platform == "win32"
