@@ -10,10 +10,16 @@ from PyQt6.QtWidgets import (
     QListWidget, QListWidgetItem, QPushButton, QFrame,
     QFileDialog, QSizePolicy, QSplitter, QTableWidget,
     QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QProgressBar, QTabWidget,
+    QProgressBar, QTabWidget, QStyledItemDelegate,
 )
 from PyQt6.QtCore import Qt, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import QFont, QColor, QIcon, QPixmap, QPainter, QPen
+
+from ui.style import ACCENT
+
+# Custom MIME type used to drag track locations from the central track table
+# onto a case in this panel's case list (see ui/main_window.py's _CentralTrackTable).
+MIME_LOCATIONS = "application/x-pmsync-locations"
 
 
 def _make_case_icon() -> QIcon:
@@ -38,6 +44,90 @@ def _fmt_bytes(b: int) -> str:
     return f"{b / 1_000:.0f} KB"
 
 
+class _CaseHoverDelegate(QStyledItemDelegate):
+    """
+    Paints a highlight overlay on the case row currently hovered during a
+    drag. A plain setBackground() per item doesn't work here: once a
+    stylesheet rule targets QListWidget::item (see style.py), Qt's style
+    engine takes over background painting entirely and ignores each item's
+    own background role — so the highlight has to be drawn on top instead.
+    """
+
+    def paint(self, painter, option, index) -> None:
+        super().paint(painter, option, index)
+        lst = self.parent()
+        if lst is not None and index.row() == getattr(lst, "_hover_row", -1):
+            painter.save()
+            tint = QColor(ACCENT)
+            tint.setAlpha(90)
+            painter.fillRect(option.rect, tint)
+            painter.restore()
+
+
+class _DroppableCaseList(QListWidget):
+    """
+    Case list that accepts drops of track locations (from the central track
+    table) or raw files/folders (from Windows Explorer) onto a case row,
+    forwarding them via the two signals below.
+    """
+
+    tracks_dropped_on_case = pyqtSignal(int, list)   # case_id, list[str locations]
+    files_dropped_on_case = pyqtSignal(int, list)    # case_id, list[str paths]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAcceptDrops(True)
+        self._hover_row = -1
+        self.setItemDelegate(_CaseHoverDelegate(self))
+
+    def _set_hover_row(self, row: int) -> None:
+        """Highlight the case row under the cursor during a drag, for visual feedback."""
+        if row == self._hover_row:
+            return
+        self._hover_row = row
+        self.viewport().update()
+
+    def dragEnterEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasFormat(MIME_LOCATIONS) or mime.hasUrls():
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event):
+        mime = event.mimeData()
+        if mime.hasFormat(MIME_LOCATIONS) or mime.hasUrls():
+            event.acceptProposedAction()
+            self._set_hover_row(self.indexAt(event.position().toPoint()).row())
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event):
+        self._set_hover_row(-1)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event):
+        self._set_hover_row(-1)
+        item = self.itemAt(event.position().toPoint())
+        if item is None:
+            event.ignore()
+            return
+        case_id = item.data(Qt.ItemDataRole.UserRole)
+        mime = event.mimeData()
+        if mime.hasFormat(MIME_LOCATIONS):
+            locations = bytes(mime.data(MIME_LOCATIONS)).decode("utf-8").split("\n")
+            locations = [loc for loc in locations if loc]
+            self.tracks_dropped_on_case.emit(case_id, locations)
+            event.acceptProposedAction()
+        elif mime.hasUrls():
+            paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+            if paths:
+                self.files_dropped_on_case.emit(case_id, paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+
 class PacemakerLibraryPanel(QWidget):
     """Displays cases in a Pacemaker music.db and exposes actions as signals."""
 
@@ -52,6 +142,9 @@ class PacemakerLibraryPanel(QWidget):
     play_track_requested = pyqtSignal(list, int)  # (list[TrackInfo], start_index)
     track_tab_play_requested = pyqtSignal(dict)   # track dict — double-click in Tracks tab
     track_tab_selected = pyqtSignal(int)          # track_id selected in Tracks tab (-1 = none)
+    new_case_requested = pyqtSignal()             # "New Case" button clicked
+    tracks_dropped_on_case = pyqtSignal(int, list)  # case_id, list[str locations]
+    files_dropped_on_case = pyqtSignal(int, list)   # case_id, list[str paths]
 
     def __init__(
         self,
@@ -65,6 +158,8 @@ class PacemakerLibraryPanel(QWidget):
         show_storage: bool = False,
         show_selection_size: bool = False,
         show_tabs: bool = False,          # Device panel: Cases + Tracks tabs
+        accept_track_drops: bool = False,  # Editor panel: drop tracks/files onto a case
+        show_new_case: bool = False,       # Editor panel: "New Case" button
         parent=None,
     ):
         super().__init__(parent)
@@ -78,6 +173,8 @@ class PacemakerLibraryPanel(QWidget):
         self._show_storage = show_storage
         self._show_selection_size = show_selection_size
         self._show_tabs = show_tabs
+        self._accept_track_drops = accept_track_drops
+        self._show_new_case = show_new_case
         self._cases: list[dict] = []
         self._managed_case_ids: set[int] = set()
         self._db_path: str = ""
@@ -159,7 +256,12 @@ class PacemakerLibraryPanel(QWidget):
             check_row.addStretch()
             layout.addLayout(check_row)
 
-        self._list = QListWidget()
+        if self._accept_track_drops:
+            self._list = _DroppableCaseList()
+            self._list.tracks_dropped_on_case.connect(self.tracks_dropped_on_case)
+            self._list.files_dropped_on_case.connect(self.files_dropped_on_case)
+        else:
+            self._list = QListWidget()
         self._list.setIconSize(QSize(14, 12))
         self._list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self._list.itemSelectionChanged.connect(self._on_selection_changed)
@@ -223,6 +325,10 @@ class PacemakerLibraryPanel(QWidget):
         self._refresh_btn = QPushButton("Refresh")
         self._refresh_btn.clicked.connect(self.refresh_requested)
         btn_row.addWidget(self._refresh_btn)
+        if self._show_new_case:
+            self._new_case_btn = QPushButton("New Case")
+            self._new_case_btn.clicked.connect(self.new_case_requested)
+            btn_row.addWidget(self._new_case_btn)
         if self._show_eject:
             self._eject_btn = QPushButton("⏏ Eject")
             self._eject_btn.clicked.connect(self.eject_requested)
@@ -391,6 +497,8 @@ class PacemakerLibraryPanel(QWidget):
         self._managed_case_ids = managed_case_ids
         self._list.blockSignals(True)
         self._list.clear()
+        if self._accept_track_drops:
+            self._list._hover_row = -1
 
         for case in cases:
             managed = case["case_id"] in managed_case_ids
@@ -476,6 +584,10 @@ class PacemakerLibraryPanel(QWidget):
         self._list.blockSignals(False)
         if self._show_selection_size:
             self._update_selection_size()
+
+    def clear_selection(self) -> None:
+        """Deselect any selected case (used by the central table's "← All Tracks" link)."""
+        self._list.clearSelection()
 
     def selected_case(self) -> "dict | None":
         """Return the single selected case, or None."""

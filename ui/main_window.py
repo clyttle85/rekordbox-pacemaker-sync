@@ -18,16 +18,17 @@ import json
 import os
 import re
 import shutil
+import sys
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QSplitter, QMessageBox,
     QDialog, QVBoxLayout, QHBoxLayout, QLabel,
     QLineEdit, QPushButton, QFileDialog, QProgressDialog,
     QApplication, QFrame, QInputDialog,
     QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
-    QStyledItemDelegate,
+    QStyledItemDelegate, QMenu,
 )
-from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QUrl, QEvent
-from PyQt6.QtGui import QAction, QPainter, QColor, QBrush
+from PyQt6.QtCore import Qt, QThread, QTimer, pyqtSignal, QObject, QUrl, QEvent, QMimeData
+from PyQt6.QtGui import QAction, QPainter, QColor, QBrush, QDrag
 
 try:
     from PyQt6.QtMultimedia import QMediaPlayer, QAudioOutput
@@ -37,8 +38,12 @@ except ImportError:
 
 from core.rekordbox_reader import RekordboxReader, PlaylistNode, TrackInfo
 from core import logger as _logger
+from ui.style import ACCENT
 
 _WAVE_COL_ROLE = Qt.ItemDataRole.UserRole + 3   # stores list[tuple[int,int]] waveform data
+
+_ROW_HOVER_TINT = QColor(ACCENT)
+_ROW_HOVER_TINT.setAlpha(90)
 
 # Color palette matching player_bar.py
 _WDELEGATE_COLORS = [
@@ -75,6 +80,7 @@ class _WaveformDelegate(QStyledItemDelegate):
                 mid_y = option.rect.center().y()
                 painter.drawLine(option.rect.left() + 2, mid_y,
                                  option.rect.right() - 2, mid_y)
+            self._paint_hover_tint(painter, option.rect, index)
             return
 
         r = option.rect
@@ -107,6 +113,16 @@ class _WaveformDelegate(QStyledItemDelegate):
             self._draw_stop_icon(painter, r)
         painter.restore()
 
+        self._paint_hover_tint(painter, option.rect, index)
+
+    def _paint_hover_tint(self, painter: QPainter, rect, index) -> None:
+        """Overlay the drag-reorder hover highlight (see _RowHoverDelegate)."""
+        table = self.parent()
+        if table is not None and index.row() == getattr(table, "_hover_row", -1):
+            painter.save()
+            painter.fillRect(rect, _ROW_HOVER_TINT)
+            painter.restore()
+
     @staticmethod
     def _draw_stop_icon(painter: QPainter, rect) -> None:
         """Light dim overlay + white stop square pinned to the left edge."""
@@ -124,6 +140,25 @@ class _WaveformDelegate(QStyledItemDelegate):
         return option.rect.size()
 
 
+class _RowHoverDelegate(QStyledItemDelegate):
+    """
+    Paints the drag-reorder hover highlight on every central-table column
+    except the waveform one (which draws its own, in _WaveformDelegate — see
+    _paint_hover_tint there). A plain per-item setBackground() doesn't work
+    here: once a stylesheet rule targets QTableWidget::item (see style.py),
+    Qt's style engine takes over background painting entirely and ignores
+    each item's own background role.
+    """
+
+    def paint(self, painter: QPainter, option, index) -> None:
+        super().paint(painter, option, index)
+        table = self.parent()
+        if table is not None and index.row() == getattr(table, "_hover_row", -1):
+            painter.save()
+            painter.fillRect(option.rect, _ROW_HOVER_TINT)
+            painter.restore()
+
+
 class _SortableItem(QTableWidgetItem):
     """QTableWidgetItem that sorts by a numeric UserRole+1 value when set."""
     _SORT_ROLE = Qt.ItemDataRole.UserRole + 1
@@ -134,25 +169,189 @@ class _SortableItem(QTableWidgetItem):
         if a is not None and b is not None:
             return a < b
         return super().__lt__(other)
+
+
+class _CentralTrackTable(QTableWidget):
+    """
+    Central track table — lists either every track in the Editor library
+    ("all tracks" mode, nothing selected) or a single case's/device's tracks.
+
+    Supports dragging selected rows out as file locations (dropped onto a
+    case in the Editor panel's case list to add them there) and accepting
+    drops of files/folders from Windows Explorer for import. Delete/right-
+    click "Remove from Case" is only active in case_mode (see set_case_mode).
+    """
+    files_dropped = pyqtSignal(list)               # list[str] local file/folder paths
+    remove_from_case_requested = pyqtSignal(list)   # list[str] locations
+    reorder_requested = pyqtSignal(list)            # list[str] locations, new case order
+
+    def __init__(self, rows: int = 0, cols: int = 0, parent=None):
+        super().__init__(rows, cols, parent)
+        self._tracks: list = []
+        self._case_mode: bool = False
+        self._hover_row: int = -1
+        self.setDragEnabled(True)
+        self.setDragDropMode(QAbstractItemView.DragDropMode.DragOnly)
+        self.setAcceptDrops(True)
+        self.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.customContextMenuRequested.connect(self._on_context_menu)
+        # Paints the drag hover/reorder highlight; the waveform column (2)
+        # paints its own copy of the same tint via _WaveformDelegate.
+        self.setItemDelegate(_RowHoverDelegate(self))
+
+    def set_tracks(self, tracks: list) -> None:
+        self._tracks = tracks
+        self._hover_row = -1
+
+    def set_case_mode(self, case_mode: bool) -> None:
+        self._case_mode = case_mode
+
+    def _row_location(self, row: int) -> "str | None":
+        """
+        The location for a given VISUAL row, resolved through the row's
+        stored original-index (column 0's UserRole) rather than indexing
+        self._tracks directly — necessary because sorting by a column
+        reorders rows on screen without reordering self._tracks itself.
+        """
+        item0 = self.item(row, 0)
+        if item0 is None:
+            return None
+        orig = item0.data(Qt.ItemDataRole.UserRole)
+        if orig is None or not (0 <= orig < len(self._tracks)):
+            return None
+        return self._tracks[orig].location
+
+    def _visual_locations(self) -> list:
+        """Every row's location, in current on-screen (possibly sorted) order."""
+        locations = (self._row_location(row) for row in range(self.rowCount()))
+        return [loc for loc in locations if loc is not None]
+
+    def _selected_locations(self) -> list:
+        rows = sorted({idx.row() for idx in self.selectedIndexes()})
+        locations = (self._row_location(r) for r in rows)
+        return [loc for loc in locations if loc is not None]
+
+    def startDrag(self, supportedActions) -> None:
+        locations = self._selected_locations()
+        if not locations:
+            return
+        mime = QMimeData()
+        mime.setData(MIME_LOCATIONS, "\n".join(locations).encode("utf-8"))
+        drag = QDrag(self)
+        drag.setMimeData(mime)
+        drag.exec(Qt.DropAction.CopyAction)
+
+    def _set_hover_row(self, row: int) -> None:
+        if row == self._hover_row:
+            return
+        self._hover_row = row
+        self.viewport().update()
+
+    def dragEnterEvent(self, event) -> None:
+        mime = event.mimeData()
+        if mime.hasUrls() or (self._case_mode and mime.hasFormat(MIME_LOCATIONS)):
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def dragMoveEvent(self, event) -> None:
+        mime = event.mimeData()
+        if self._case_mode and mime.hasFormat(MIME_LOCATIONS):
+            event.acceptProposedAction()
+            self._set_hover_row(self.indexAt(event.position().toPoint()).row())
+        elif mime.hasUrls():
+            event.acceptProposedAction()
+            self._set_hover_row(-1)
+        else:
+            event.ignore()
+
+    def dragLeaveEvent(self, event) -> None:
+        self._set_hover_row(-1)
+        super().dragLeaveEvent(event)
+
+    def dropEvent(self, event) -> None:
+        self._set_hover_row(-1)
+        mime = event.mimeData()
+        if self._case_mode and mime.hasFormat(MIME_LOCATIONS):
+            dragged = bytes(mime.data(MIME_LOCATIONS)).decode("utf-8").split("\n")
+            dragged = [d for d in dragged if d]
+            if not dragged:
+                event.ignore()
+                return
+            pos = event.position().toPoint()
+            index = self.indexAt(pos)
+            row = index.row()
+            if row != -1 and pos.y() > self.visualRect(index).center().y():
+                row += 1   # dropped on the lower half of the row -> insert after it
+            self._emit_reorder(dragged, row)
+            event.acceptProposedAction()
+        elif mime.hasUrls():
+            paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+            if paths:
+                self.files_dropped.emit(paths)
+            event.acceptProposedAction()
+        else:
+            event.ignore()
+
+    def _emit_reorder(self, dragged_locations: list, insert_before_visual_row: int) -> None:
+        """
+        Reassemble the case's track order: take the current on-screen order,
+        pull the dragged tracks out, and reinsert them (keeping their
+        relative order) at the drop position.
+        """
+        dragged_set = set(dragged_locations)
+        all_locations = self._visual_locations()
+        if insert_before_visual_row == -1:
+            insert_before_visual_row = len(all_locations)
+        insert_at = sum(
+            1 for loc in all_locations[:insert_before_visual_row] if loc not in dragged_set
+        )
+        remaining = [loc for loc in all_locations if loc not in dragged_set]
+        new_order = remaining[:insert_at] + dragged_locations + remaining[insert_at:]
+        if new_order != [t.location for t in self._tracks]:
+            self.reorder_requested.emit(new_order)
+
+    def keyPressEvent(self, event) -> None:
+        if self._case_mode and event.key() == Qt.Key.Key_Delete:
+            locations = self._selected_locations()
+            if locations:
+                self.remove_from_case_requested.emit(locations)
+            return
+        super().keyPressEvent(event)
+
+    def _on_context_menu(self, pos) -> None:
+        if not self._case_mode or not self.selectedIndexes():
+            return
+        menu = QMenu(self)
+        action = menu.addAction("Remove from Case")
+        if menu.exec(self.viewport().mapToGlobal(pos)) == action:
+            locations = self._selected_locations()
+            if locations:
+                self.remove_from_case_requested.emit(locations)
+
+
 from core.pacemaker_writer import PacemakerWriter
 from core import sync_state
-from core.device_finder import find_editor_db, find_device_db
+from core.device_finder import (
+    find_device_db, ensure_editor_db,
+    device_root, device_music_root, is_on_device,
+)
 from core.m3u8_reader import load_m3u8_tracks
+from core.file_import import read_tracks_from_paths
 from ui.playlist_tree import PlaylistTreeWidget
 from ui.sync_panel import SyncPanel, SyncQueueItem
-from ui.pacemaker_panel import PacemakerLibraryPanel
+from ui.pacemaker_panel import PacemakerLibraryPanel, MIME_LOCATIONS
 from ui.player_bar import PlayerBar
 
 
 # ---------------------------------------------------------------------------
-# Per-device sync map  (<drive>:\.Pacemaker\rb_sync_map.json)
+# Per-device sync map  (<device root>/.Pacemaker/rb_sync_map.json)
 # Maps str(editor_case_id) → device_case_id so each device independently
 # tracks which Editor cases have been pushed to it.
 # ---------------------------------------------------------------------------
 
 def _sync_map_path(device_db: str) -> str:
-    drive = os.path.splitdrive(device_db)[0]
-    return os.path.join(drive, os.sep, ".Pacemaker", "rb_sync_map.json")
+    return os.path.join(device_root(device_db), ".Pacemaker", "rb_sync_map.json")
 
 
 def _read_sync_map(device_db: str) -> dict:
@@ -254,6 +453,41 @@ class SyncWorker(QObject):
 
 
 # ---------------------------------------------------------------------------
+# Background worker: drag-and-drop file import (Explorer → Editor library,
+# optionally straight into a case)
+# ---------------------------------------------------------------------------
+
+class FileImportWorker(QObject):
+    progress = pyqtSignal(int, int, str)     # current, total, status message
+    finished = pyqtSignal(bool, str, list)    # success, message, unreadable files
+
+    def __init__(self, db_path: str, paths: list[str], case_id: "int | None"):
+        super().__init__()
+        self._db_path = db_path
+        self._paths = paths
+        self._case_id = case_id
+
+    def run(self):
+        try:
+            self.progress.emit(0, 0, "Reading files…")
+            tracks, errors = read_tracks_from_paths(self._paths)
+            total = len(tracks)
+
+            with PacemakerWriter(self._db_path) as writer:
+                for i, track in enumerate(tracks):
+                    label = track.title or os.path.basename(track.location)
+                    self.progress.emit(i, total, f"Importing: {label}")
+                    track_id = writer.insert_or_get_track(track)
+                    if self._case_id is not None and not writer.is_track_in_case(self._case_id, track_id):
+                        writer.link_track_to_case(self._case_id, track_id)
+                    self.progress.emit(i + 1, total, f"Importing: {label}")
+
+            self.finished.emit(True, f"Imported {total} track(s).", errors)
+        except Exception as e:
+            self.finished.emit(False, str(e), [])
+
+
+# ---------------------------------------------------------------------------
 # Background worker: Editor → Device sync (add new + remove unchecked)
 # ---------------------------------------------------------------------------
 
@@ -272,23 +506,21 @@ class DeviceSyncWorker(QObject):
 
     @staticmethod
     def _delete_device_files(locations: list[str], device_db: str) -> None:
-        r"""
-        Delete audio files (and their .str companions) for the given pmdb locations.
-        /pmdb_tracks/a/b/xxxxxxxx.mp3  ->  <drive>:\.Pacemaker\Music\a\b\xxxxxxxx.mp3
         """
-        device_drive = os.path.splitdrive(device_db)[0]
+        Delete audio files (and their .str companions) for the given pmdb locations.
+        /pmdb_tracks/a/b/xxxxxxxx.mp3  ->  <device root>/.Pacemaker/Music/a/b/xxxxxxxx.mp3
+        """
+        music_root = device_music_root(device_db)
         for loc in locations:
             if loc.startswith("/pmdb_tracks/"):
                 rel = loc[len("/pmdb_tracks/"):].replace("/", os.sep)
-                win_path = os.path.join(
-                    device_drive, os.sep, ".Pacemaker", "Music", rel
-                )
+                local_path = os.path.join(music_root, rel)
             else:
-                win_path = loc  # old-format path stored as Windows path
+                local_path = loc  # old-format path stored as a local path
             try:
-                if os.path.exists(win_path):
-                    os.remove(win_path)
-                str_path = os.path.splitext(win_path)[0] + ".str"
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+                str_path = os.path.splitext(local_path)[0] + ".str"
                 if os.path.exists(str_path):
                     os.remove(str_path)
             except Exception:
@@ -311,17 +543,16 @@ class DeviceSyncWorker(QObject):
     @staticmethod
     def _copy_track(src_path: str, device_db: str) -> tuple[str, str]:
         """
-        Copy src_path to the correct location under J:\\.Pacemaker\\Music\\X\\Y\\
+        Copy src_path to the correct location under <device root>/.Pacemaker/Music/X/Y/
         and create the companion 0-byte .str file the firmware expects.
-        Returns (windows_dest_path, pmdb_location_string).
+        Returns (local_dest_path, pmdb_location_string).
         """
         import zlib
-        device_drive = os.path.splitdrive(device_db)[0]   # e.g. "J:"
         crc = f"{zlib.crc32(src_path.encode()) & 0xFFFFFFFF:08x}"
         ext = os.path.splitext(src_path)[1].lower()
         dir1, dir2 = crc[0], crc[1]
 
-        dest_dir = os.path.join(device_drive, os.sep, ".Pacemaker", "Music", dir1, dir2)
+        dest_dir = os.path.join(device_music_root(device_db), dir1, dir2)
         os.makedirs(dest_dir, exist_ok=True)
 
         dest = os.path.join(dest_dir, f"{crc}{ext}")
@@ -453,18 +684,17 @@ class RepairDeviceDbDialog(QDialog):
 
         if device_db:
             self._db_edit.setText(device_db)
-            drive = os.path.splitdrive(device_db)[0]
-            # Music lives at J:\.Pacemaker\Music\ — default scan root there
-            music_root = os.path.join(drive, os.sep, ".Pacemaker", "Music")
+            # Music lives at <device root>/.Pacemaker/Music — default scan root there
+            music_root = device_music_root(device_db)
             if os.path.isdir(music_root):
                 self._scan_root = music_root
                 self._scan_edit.setText(music_root)
             else:
                 # Fallback to device root
-                device_root = drive + os.sep
-                if os.path.isdir(device_root):
-                    self._scan_root = device_root
-                    self._scan_edit.setText(device_root)
+                root = device_root(device_db)
+                if os.path.isdir(root):
+                    self._scan_root = root
+                    self._scan_edit.setText(root)
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -528,8 +758,7 @@ class RepairDeviceDbDialog(QDialog):
             return
         self._device_db = path
         self._db_edit.setText(path)
-        drive = os.path.splitdrive(path)[0]
-        music_root = os.path.join(drive, os.sep, ".Pacemaker", "Music")
+        music_root = device_music_root(path)
         if os.path.isdir(music_root) and not self._scan_edit.text():
             self._scan_root = music_root
             self._scan_edit.setText(music_root)
@@ -550,11 +779,6 @@ class RepairDeviceDbDialog(QDialog):
 
         self._result_label.setText("Scanning…")
         QApplication.processEvents()
-
-        # The device drive letter (e.g. "J:"). A stored path is only valid if
-        # it starts with this drive — anything else is a PC path and is broken
-        # even if the file happens to exist on the PC.
-        device_drive = os.path.splitdrive(self._device_db)[0].upper()  # e.g. "J:"
 
         # Index every audio file on the device by lowercase filename
         file_index: dict[str, str] = {}
@@ -579,21 +803,21 @@ class RepairDeviceDbDialog(QDialog):
             self._result_label.setText("Scan failed.")
             return
 
-        device_drive = os.path.splitdrive(self._device_db)[0].upper()  # e.g. "J:"
+        music_root = device_music_root(self._device_db)
 
-        def pmdb_to_windows(loc: str) -> str:
-            """Convert /pmdb_tracks/X/Y/hash.mp3 → J:\\.Pacemaker\\Music\\X\\Y\\hash.mp3"""
+        def pmdb_to_local(loc: str) -> str:
+            """Convert /pmdb_tracks/X/Y/hash.mp3 -> <device root>/.Pacemaker/Music/X/Y/hash.mp3"""
             rel = loc.replace("/pmdb_tracks/", "").replace("/", os.sep)
-            return os.path.join(device_drive, os.sep, ".Pacemaker", "Music", rel)
+            return os.path.join(music_root, rel)
 
         def is_valid_device_path(loc: str) -> bool:
             """A location is valid if it's a pmdb path and the file exists on the device."""
             if not loc:
                 return False
             if loc.startswith("/pmdb_tracks/"):
-                return os.path.exists(pmdb_to_windows(loc))
-            # Windows path on the device drive — legacy check
-            return os.path.splitdrive(loc)[0].upper() == device_drive and os.path.exists(loc)
+                return os.path.exists(pmdb_to_local(loc))
+            # A local path on the device — legacy check
+            return is_on_device(loc, self._device_db) and os.path.exists(loc)
 
         self._fixes = []
         unmatched = []
@@ -787,6 +1011,8 @@ class MainWindow(QMainWindow):
         self._sync_progress_dlg: QProgressDialog | None = None
         self._push_thread: QThread | None = None
         self._push_progress_dlg: QProgressDialog | None = None
+        self._import_thread: QThread | None = None
+        self._import_progress_dlg: QProgressDialog | None = None
 
         # Inline waveform preview player (separate from the main PlayerBar)
         self._preview_row: int = -1
@@ -869,7 +1095,8 @@ class MainWindow(QMainWindow):
             show_checkboxes=True,
             show_tracklist=False,
             show_selection_size=True,
-            show_tabs=True,
+            accept_track_drops=True,
+            show_new_case=True,
         )
         self._editor_panel.refresh_requested.connect(self._load_editor_library)
         self._editor_panel.delete_requested.connect(self._on_delete_editor_case)
@@ -877,8 +1104,9 @@ class MainWindow(QMainWindow):
         self._editor_panel.inline_rename_committed.connect(self._on_inline_rename_editor_case)
         self._editor_panel.push_requested.connect(self._confirm_and_sync_to_device)
         self._editor_panel.case_selected.connect(self._on_editor_case_selected)
-        self._editor_panel.track_tab_play_requested.connect(self._on_track_tab_play)
-        self._editor_panel.track_tab_selected.connect(self._on_track_tab_selected)
+        self._editor_panel.new_case_requested.connect(self._on_new_case_requested)
+        self._editor_panel.tracks_dropped_on_case.connect(self._on_tracks_dropped_on_case)
+        self._editor_panel.files_dropped_on_case.connect(self._on_files_dropped_on_case)
 
         # ── Device library panel ──────────────────────────────────────────
         self._device_panel = PacemakerLibraryPanel(
@@ -1038,7 +1266,7 @@ class MainWindow(QMainWindow):
         return strip
 
     def _build_main_area(self) -> QWidget:
-        from ui.style import BG_PANEL, BORDER, FG_SECONDARY
+        from ui.style import BG_PANEL, BORDER, FG_SECONDARY, ACCENT
 
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -1053,16 +1281,27 @@ class MainWindow(QMainWindow):
         )
         hdr_layout = QHBoxLayout(hdr)
         hdr_layout.setContentsMargins(12, 0, 12, 0)
+        self._all_tracks_btn = QPushButton("← All Tracks")
+        self._all_tracks_btn.setFlat(True)
+        self._all_tracks_btn.setCursor(Qt.CursorShape.PointingHandCursor)
+        self._all_tracks_btn.setStyleSheet(
+            f"QPushButton {{ color: {ACCENT}; border: none; background: transparent; "
+            f"font-size: 11px; padding: 0; }}"
+            f"QPushButton:hover {{ text-decoration: underline; }}"
+        )
+        self._all_tracks_btn.clicked.connect(self._on_show_all_tracks_clicked)
+        self._all_tracks_btn.setVisible(False)
+        hdr_layout.addWidget(self._all_tracks_btn)
         self._track_view_lbl = QLabel("Select a playlist or case to view tracks")
         self._track_view_lbl.setStyleSheet(f"color: {FG_SECONDARY}; font-size: 11px;")
         hdr_layout.addWidget(self._track_view_lbl)
         hdr_layout.addStretch()
         layout.addWidget(hdr)
 
-        # Central track table  cols: #  ★  ~wave  Title  Artist  BPM  Key  Time  Genre
-        self._track_table = QTableWidget(0, 9)
+        # Central track table  cols: #  ★  ~wave  Title  Artist  BPM  Key  Time  Genre  Cases
+        self._track_table = _CentralTrackTable(0, 10)
         self._track_table.setHorizontalHeaderLabels(
-            ["#", "★", "~", "Title", "Artist", "BPM", "Key", "Time", "Genre"]
+            ["#", "★", "~", "Title", "Artist", "BPM", "Key", "Time", "Genre", "Cases"]
         )
         hh = self._track_table.horizontalHeader()
         for col, mode in enumerate([
@@ -1075,6 +1314,7 @@ class MainWindow(QMainWindow):
             QHeaderView.ResizeMode.Fixed,    # Key
             QHeaderView.ResizeMode.Fixed,    # Time
             QHeaderView.ResizeMode.Fixed,    # Genre
+            QHeaderView.ResizeMode.Fixed,    # Cases
         ]):
             hh.setSectionResizeMode(col, mode)
         self._track_table.setColumnWidth(0, 36)
@@ -1084,11 +1324,13 @@ class MainWindow(QMainWindow):
         self._track_table.setColumnWidth(6, 58)
         self._track_table.setColumnWidth(7, 56)
         self._track_table.setColumnWidth(8, 100)
+        self._track_table.setColumnWidth(9, 48)
+        self._track_table.setColumnHidden(9, True)   # only shown in "all tracks" mode
         self._wave_delegate = _WaveformDelegate(self._track_table)
         self._track_table.setItemDelegateForColumn(2, self._wave_delegate)
 
         self._track_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
-        self._track_table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._track_table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._track_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self._track_table.verticalHeader().setVisible(False)
         self._track_table.setAlternatingRowColors(True)
@@ -1098,10 +1340,14 @@ class MainWindow(QMainWindow):
         hh.setSectionResizeMode(2, QHeaderView.ResizeMode.Fixed)   # lock waveform col
         self._track_table.itemDoubleClicked.connect(self._on_track_double_clicked)
         self._track_table.viewport().installEventFilter(self)
+        self._track_table.files_dropped.connect(self._on_central_files_dropped)
+        self._track_table.remove_from_case_requested.connect(self._on_remove_from_case_requested)
+        self._track_table.reorder_requested.connect(self._on_reorder_requested)
 
         # Store tracks and source for playback
         self._track_table_tracks: list[TrackInfo] = []
-        self._track_table_source: str = ""   # "editor" | "device" | ""
+        self._track_table_source: str = ""   # "editor" | "editor_all" | "device" | ""
+        self._track_table_case_id: "int | None" = None   # editor case open in the table, if any
 
         layout.addWidget(self._track_table, stretch=1)
         return widget
@@ -1123,7 +1369,11 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _autodetect_pacemaker_dbs(self):
-        editor_path = find_editor_db()
+        # ensure_editor_db() creates a fresh, empty Editor DB at the default
+        # per-platform location if one doesn't exist yet (e.g. first run on a
+        # machine that never had the real Tonium Editor installed, or any
+        # first run at all on macOS).
+        editor_path = ensure_editor_db()
         if editor_path:
             self._panel.set_db_path(editor_path)   # triggers _on_editor_db_changed
 
@@ -1500,20 +1750,28 @@ class MainWindow(QMainWindow):
         try:
             with PacemakerWriter(db_path) as writer:
                 cases = writer.get_all_cases()
-                all_tracks = writer.get_all_tracks_with_case_count()
             self._editor_panel.load_cases(cases, set())
-            self._editor_panel.load_all_device_tracks(all_tracks)
         except Exception as e:
             self._editor_panel.clear()
             self.statusBar().showMessage(f"Could not read Editor library: {e}")
             return
         self._apply_device_sync_state(extra_checked=currently_checked)
+        # Default/refresh the central table to the whole-library view unless
+        # a specific case is currently open there.
+        if self._track_table_source in ("", "editor_all"):
+            self._show_all_editor_tracks()
 
     def _on_editor_case_selected(self, case_id: int) -> None:
-        """Load Editor case tracks into the central track table."""
+        """
+        Load Editor case tracks into the central track table, or show the
+        whole-library "all tracks" view when nothing is selected.
+        """
         db_path = self._panel.db_path
-        if not db_path or case_id == -1:
+        if not db_path:
             self._clear_track_table()
+            return
+        if case_id == -1:
+            self._show_all_editor_tracks()
             return
         try:
             with PacemakerWriter(db_path) as writer:
@@ -1522,6 +1780,33 @@ class MainWindow(QMainWindow):
             name = case["name"] if case else "Case"
             self._load_tracks_in_table(tracks, source="editor",
                                        label=f"{name}  —  {len(tracks)} tracks")
+            self._track_table_case_id = case_id
+            self._track_table.set_case_mode(True)
+        except Exception:
+            self._clear_track_table()
+
+    def _show_all_editor_tracks(self) -> None:
+        """
+        Show every track in the Editor library — the default view when no
+        case is selected, and the drag source for assigning tracks to cases.
+        """
+        db_path = self._panel.db_path
+        if not db_path:
+            self._clear_track_table()
+            return
+        try:
+            with PacemakerWriter(db_path) as writer:
+                pairs = writer.get_all_tracks_as_trackinfo()
+            tracks = [p[0] for p in pairs]
+            case_counts = [p[1] for p in pairs]
+            orphan_count = sum(1 for c in case_counts if c == 0)
+            label = f"All Tracks  —  {len(tracks)} tracks"
+            if orphan_count:
+                label += f"  ·  {orphan_count} unassigned"
+            self._load_tracks_in_table(tracks, source="editor_all", label=label,
+                                       case_counts=case_counts)
+            self._track_table_case_id = None
+            self._track_table.set_case_mode(False)
         except Exception:
             self._clear_track_table()
 
@@ -1541,8 +1826,13 @@ class MainWindow(QMainWindow):
         except Exception:
             self._clear_track_table()
 
-    def _load_tracks_in_table(self, tracks: list[TrackInfo], source: str, label: str) -> None:
-        """Populate the central track table. source='editor'|'device'."""
+    def _load_tracks_in_table(self, tracks: list[TrackInfo], source: str, label: str,
+                               case_counts: "list[int] | None" = None) -> None:
+        """
+        Populate the central track table. source='editor'|'editor_all'|'device'.
+        case_counts, when given (whole-library "all tracks" view only), shows
+        and fills the Cases column and greys out rows for orphaned tracks.
+        """
         from ui.style import ACCENT
         from PyQt6.QtGui import QColor as _QColor
 
@@ -1556,10 +1846,14 @@ class MainWindow(QMainWindow):
         self._track_table.setSortingEnabled(False)
         self._track_table.setRowCount(0)
         self._track_table_tracks = list(tracks)
+        self._track_table.set_tracks(self._track_table_tracks)
         self._track_table_source = source
         self._track_view_lbl.setText(label)
+        self._all_tracks_btn.setVisible(source == "editor")
+        self._track_table.setColumnHidden(9, case_counts is None)
 
         STAR_MAP = {0: "", 1: "★", 2: "★★", 3: "★★★", 4: "★★★★", 5: "★★★★★"}
+        orphan_color = _QColor("#888888")
 
         for i, t in enumerate(tracks):
             self._track_table.insertRow(i)
@@ -1570,27 +1864,33 @@ class MainWindow(QMainWindow):
                 bpm_val = round(bpm_val / 100)
             bpm = str(bpm_val) if bpm_val else ""
             stars = STAR_MAP.get(t.rating, "")
+            case_count = case_counts[i] if case_counts else None
+            is_orphan = case_count == 0
 
-            # cols: #(0) ★(1) ~wave(2) Title(3) Artist(4) BPM(5) Key(6) Time(7) Genre(8)
+            # cols: #(0) ★(1) ~wave(2) Title(3) Artist(4) BPM(5) Key(6) Time(7) Genre(8) Cases(9)
             _numeric_sort = {0: i + 1, 5: bpm_val, 7: secs}
             for col, val in enumerate([
                 str(i + 1), stars, "", t.title or "", t.artist or "",
                 bpm, t.key or "", duration, t.genre or "",
+                str(case_count) if case_count is not None else "",
             ]):
                 item = _SortableItem(val)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
                 item.setData(Qt.ItemDataRole.UserRole, i)
                 if col in _numeric_sort:
                     item.setData(_SortableItem._SORT_ROLE, _numeric_sort[col])
-                if col in (0, 1, 2, 5, 6, 7):
+                if col in (0, 1, 2, 5, 6, 7, 9):
                     item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
                 if col == 1 and val:
                     item.setForeground(_QColor(ACCENT))
+                elif is_orphan and col != 1:
+                    item.setForeground(orphan_color)
                 self._track_table.setItem(i, col, item)
 
         self._track_table.setSortingEnabled(True)
 
-        # Fetch waveforms in background (only for editor source where we have RB data)
+        # Fetch waveforms in background (only for a single open case, where we
+        # have RB data — never for the whole-library "all tracks" view)
         if source == "editor" and self._rb_reader and tracks:
             self._start_waveform_batch([t.location for t in tracks])
 
@@ -1645,12 +1945,26 @@ class MainWindow(QMainWindow):
     def _clear_track_table(self) -> None:
         self._track_table.setRowCount(0)
         self._track_table_tracks = []
+        self._track_table.set_tracks([])
         self._track_table_source = ""
+        self._track_table_case_id = None
+        self._track_table.set_case_mode(False)
+        self._track_table.setColumnHidden(9, True)
         self._track_view_lbl.setText("Select a playlist or case to view tracks")
+        self._all_tracks_btn.setVisible(False)
+
+    def _on_show_all_tracks_clicked(self) -> None:
+        """"← All Tracks" link — deselect the open case and show the whole library."""
+        self._editor_panel.clear_selection()
+        # Deselecting normally triggers this via case_selected(-1), but if the
+        # list had nothing selected to begin with (e.g. the open case was just
+        # deleted, so it's already gone from the list) that signal never
+        # fires — call it directly so the link always works.
+        self._show_all_editor_tracks()
 
     def _on_track_double_clicked(self, item: QTableWidgetItem) -> None:
-        """Play the double-clicked track (Editor source only)."""
-        if self._track_table_source != "editor":
+        """Play the double-clicked track (Editor sources only)."""
+        if self._track_table_source not in ("editor", "editor_all"):
             return
         orig_row = item.data(Qt.ItemDataRole.UserRole)
         if orig_row is None:
@@ -1662,7 +1976,7 @@ class MainWindow(QMainWindow):
         """Highlight the currently playing track row in the table."""
         from PyQt6.QtGui import QColor
         from ui.style import ACCENT
-        if self._track_table_source != "editor":
+        if self._track_table_source not in ("editor", "editor_all"):
             return
         for row in range(self._track_table.rowCount()):
             item = self._track_table.item(row, 0)
@@ -1764,15 +2078,23 @@ class MainWindow(QMainWindow):
             self._stop_preview()
 
     def _on_delete_editor_case(self, cases: list):
+        deleted_ids = {c["case_id"] for c in cases}
+
+        def _refresh():
+            self._load_editor_library()
+            self._refresh_tree()
+            self._recompute_queue()
+            # If the case open in the central table was just deleted, its
+            # track view is now stale (and the "All Tracks" link would have
+            # nothing to deselect) — fall back to the whole-library view.
+            if self._track_table_case_id in deleted_ids:
+                self._show_all_editor_tracks()
+
         self._delete_cases(
             db_path=self._panel.db_path,
             cases=cases,
             update_sync_state=True,
-            refresh_fn=lambda: (
-                self._load_editor_library(),
-                self._refresh_tree(),
-                self._recompute_queue(),
-            ),
+            refresh_fn=_refresh,
         )
 
     def _on_rename_editor_case(self, cases: list):
@@ -1817,45 +2139,156 @@ class MainWindow(QMainWindow):
             _logger.log.error("Inline rename failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Rename Failed", str(e))
 
-    def _on_track_tab_play(self, track_dict: dict) -> None:
-        """Play a track selected by double-click in the editor Tracks tab."""
-        location = track_dict.get("location") or ""
-        if not location or not os.path.exists(location):
-            self.statusBar().showMessage(f"File not found: {location}")
+    def _on_new_case_requested(self) -> None:
+        """Handle the Editor panel's "New Case" button."""
+        db_path = self._panel.db_path
+        if not db_path:
+            QMessageBox.warning(self, "No Database", "Please select an Editor database first.")
             return
-        track = TrackInfo(
-            location=location,
-            title=track_dict.get("title") or "",
-            artist=track_dict.get("artist") or "",
-            album="", album_artist="", composer="", genre="",
-            label="", producer="", remixer="", key="",
-            year="", comments="",
-            bpm=float(track_dict.get("bpm") or 0),
-            rating=int(track_dict.get("rating") or 0),
-            track_number=0, number_of_tracks=0,
-            disc_number=0, number_of_discs=0,
-            bit_rate=int(track_dict.get("bit_rate") or 0),
-            sample_rate=int(track_dict.get("sample_rate") or 0),
-            play_time_secs=int(track_dict.get("play_time_secs") or 0),
-            file_size=int(track_dict.get("file_size") or 0),
-            format=track_dict.get("format") or "",
-        )
-        self._player_bar.load_and_play([track], 0)
+        name, ok = QInputDialog.getText(self, "New Case", "Case name:")
+        name = name.strip()
+        if not ok or not name:
+            return
+        try:
+            with PacemakerWriter(db_path) as writer:
+                writer.create_case(name)
+            self._load_editor_library()
+            self.statusBar().showMessage(f"Created case \"{name}\".")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
 
-    def _on_track_tab_selected(self, track_id: int) -> None:
-        """Show which cases contain the selected track in the Tracks tab banner."""
-        if track_id == -1:
-            self._editor_panel.set_track_cases_banner([])
+    def _on_tracks_dropped_on_case(self, case_id: int, locations: list) -> None:
+        """Handle tracks dragged from the central table onto a case in the side list."""
+        db_path = self._panel.db_path
+        if not db_path:
+            return
+        added = 0
+        try:
+            with PacemakerWriter(db_path) as writer:
+                for loc in locations:
+                    track_id = writer.get_track_id_by_location(loc)
+                    if track_id is None:
+                        continue
+                    if writer.is_track_in_case(case_id, track_id):
+                        continue
+                    writer.link_track_to_case(case_id, track_id)
+                    added += 1
+            self._load_editor_library()
+            self._refresh_open_editor_track_view(case_id)
+            self.statusBar().showMessage(f"Added {added} track(s) to case.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _on_files_dropped_on_case(self, case_id: int, paths: list) -> None:
+        """Handle files/folders dragged from Explorer directly onto a case."""
+        self._import_dropped_files(paths, case_id)
+
+    def _on_central_files_dropped(self, paths: list) -> None:
+        """
+        Handle files/folders dragged from Explorer onto the central table.
+        Imports straight into the currently open case, or as orphan tracks
+        when the whole-library "all tracks" view is showing.
+        """
+        if self._track_table_source not in ("editor", "editor_all"):
+            return
+        self._import_dropped_files(paths, self._track_table_case_id)
+
+    def _import_dropped_files(self, paths: list, case_id: "int | None") -> None:
+        db_path = self._panel.db_path
+        if not db_path:
+            QMessageBox.warning(self, "No Database", "Please select an Editor database first.")
+            return
+
+        self._import_progress_dlg = QProgressDialog(
+            "Reading files…", None, 0, 0, self
+        )
+        self._import_progress_dlg.setWindowTitle("Importing Tracks")
+        self._import_progress_dlg.setWindowModality(Qt.WindowModality.WindowModal)
+        self._import_progress_dlg.setMinimumDuration(0)
+        self._import_progress_dlg.show()
+
+        self._import_thread = QThread()
+        self._import_worker = FileImportWorker(db_path, paths, case_id)
+        self._import_worker.moveToThread(self._import_thread)
+        self._import_thread.started.connect(self._import_worker.run)
+
+        def on_progress(i, n, msg, _dlg=self._import_progress_dlg):
+            if n:
+                _dlg.setRange(0, n)
+                _dlg.setValue(i)
+            _dlg.setLabelText(msg)
+
+        self._import_worker.progress.connect(on_progress)
+        self._import_worker.finished.connect(self._on_import_finished)
+        self._import_worker.finished.connect(self._import_thread.quit)
+        self._import_thread.start()
+
+    def _on_import_finished(self, success: bool, message: str, errors: list) -> None:
+        if self._import_progress_dlg:
+            self._import_progress_dlg.close()
+            self._import_progress_dlg = None
+        if success:
+            self._load_editor_library()
+            self._refresh_open_editor_track_view(None)
+            if errors:
+                message += f"\n\n{len(errors)} file(s) could not be read and were skipped."
+            self.statusBar().showMessage(message)
+        else:
+            QMessageBox.critical(self, "Import Error", message)
+
+    def _refresh_open_editor_track_view(self, affected_case_id: "int | None") -> None:
+        """
+        Re-render the open case's track view if it's affected. (The
+        whole-library "all tracks" view is already refreshed by
+        _load_editor_library, called just before this in every handler.)
+        """
+        if self._track_table_source == "editor" and (
+            affected_case_id is None or self._track_table_case_id == affected_case_id
+        ):
+            self._on_editor_case_selected(self._track_table_case_id)
+
+    def _on_remove_from_case_requested(self, locations: list) -> None:
+        """Unlink selected tracks from the currently open case (Delete key / context menu)."""
+        if self._track_table_source != "editor" or self._track_table_case_id is None:
             return
         db_path = self._panel.db_path
         if not db_path:
             return
+        case_id = self._track_table_case_id
+        removed = 0
         try:
             with PacemakerWriter(db_path) as writer:
-                names = writer.get_cases_for_track(track_id)
-            self._editor_panel.set_track_cases_banner(names)
-        except Exception:
-            self._editor_panel.set_track_cases_banner([])
+                for loc in locations:
+                    track_id = writer.get_track_id_by_location(loc)
+                    if track_id is None:
+                        continue
+                    writer.unlink_track_from_case(case_id, track_id)
+                    removed += 1
+            self._load_editor_library()
+            self._refresh_open_editor_track_view(case_id)
+            self.statusBar().showMessage(f"Removed {removed} track(s) from case.")
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+
+    def _on_reorder_requested(self, new_order_locations: list) -> None:
+        """Persist a drag-reorder of tracks within the currently open case."""
+        if self._track_table_source != "editor" or self._track_table_case_id is None:
+            return
+        db_path = self._panel.db_path
+        if not db_path:
+            return
+        case_id = self._track_table_case_id
+        try:
+            with PacemakerWriter(db_path) as writer:
+                track_ids = []
+                for loc in new_order_locations:
+                    track_id = writer.get_track_id_by_location(loc)
+                    if track_id is not None:
+                        track_ids.append(track_id)
+                writer.reorder_case_tracks(case_id, track_ids)
+            self._refresh_open_editor_track_view(case_id)
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
 
     # ------------------------------------------------------------------
     # Device library panel
@@ -1894,22 +2327,10 @@ class MainWindow(QMainWindow):
 
     def _load_device_storage(self) -> None:
         """Read device drive free/total space and used bytes from DB, update storage bar."""
-        import ctypes
         device_db = self._device_panel.db_path
         if not device_db:
             return
-        drive = os.path.splitdrive(device_db)[0] + os.sep  # e.g. "J:\"
-
-        # Get drive capacity from OS
-        free_bytes = ctypes.c_ulonglong(0)
-        total_bytes = ctypes.c_ulonglong(0)
-        ctypes.windll.kernel32.GetDiskFreeSpaceExW(
-            drive, None, ctypes.byref(total_bytes), ctypes.byref(free_bytes)
-        )
-        total = total_bytes.value
-        free = free_bytes.value
-        used = total - free
-
+        total, used, free = shutil.disk_usage(device_root(device_db))
         self._device_panel.set_storage_info(used, total)
 
     def _apply_device_sync_state(self, extra_checked: "set[int] | None" = None) -> None:
@@ -1941,10 +2362,14 @@ class MainWindow(QMainWindow):
         db_path = self._device_panel.db_path
         if not db_path:
             return
-        drive = os.path.splitdrive(db_path)[0]   # e.g. "J:"
-        letter = drive.rstrip(":")               # "J"
+        root = device_root(db_path)   # e.g. "J:\" or "/Volumes/PACEMAKER"
 
-        ok, err = self._do_eject(letter)
+        if sys.platform.startswith("win"):
+            letter = os.path.splitdrive(root)[0].rstrip(":")   # "J:\" -> "J"
+            ok, err = self._do_eject_windows(letter)
+        else:
+            ok, err = self._do_eject_mac(root)
+
         # Clear the UI regardless — the device is being disconnected
         self._device_panel.set_db_path_label("")
         self._device_panel.clear()
@@ -1953,17 +2378,18 @@ class MainWindow(QMainWindow):
         self._editor_panel.set_checked_cases(set())
         self._editor_panel.push_button.setEnabled(False)
         if ok:
-            self.statusBar().showMessage(f"{drive} ejected — safe to disconnect.")
+            self.statusBar().showMessage(f"{root} ejected — safe to disconnect.")
         else:
+            fallback = ("Use 'Safely Remove Hardware' in the system tray."
+                        if sys.platform.startswith("win")
+                        else "Try ejecting it from Finder instead.")
             QMessageBox.warning(
                 self, "Eject Failed",
-                f"Could not safely eject {drive}.\n"
-                f"{err}\n\n"
-                "Use 'Safely Remove Hardware' in the system tray."
+                f"Could not safely eject {root}.\n{err}\n\n{fallback}"
             )
 
     @staticmethod
-    def _do_eject(letter: str):
+    def _do_eject_windows(letter: str):
         """
         Physically eject a drive via Windows DeviceIoControl.
         Sequence: open volume → lock → dismount → eject media.
@@ -2013,6 +2439,25 @@ class MainWindow(QMainWindow):
         finally:
             k32.CloseHandle(handle)
 
+    @staticmethod
+    def _do_eject_mac(mount_path: str):
+        """
+        Eject a mounted volume via `diskutil eject`.
+        Returns (success: bool, error_message: str).
+        NOTE: written from Windows — needs verification on an actual Mac.
+        """
+        import subprocess
+        try:
+            result = subprocess.run(
+                ["diskutil", "eject", mount_path],
+                capture_output=True, text=True, timeout=15,
+            )
+            if result.returncode == 0:
+                return True, ""
+            return False, (result.stderr or result.stdout).strip()
+        except Exception as e:
+            return False, str(e)
+
     # ------------------------------------------------------------------
     # Device auto-detection (polled every 2 s)
     # ------------------------------------------------------------------
@@ -2039,10 +2484,10 @@ class MainWindow(QMainWindow):
         """Called when a Pacemaker drive is detected. Loads its library."""
         self._device_panel.set_db_path_label(db_path)
         self._load_device_library()
-        drive = os.path.splitdrive(db_path)[0]
-        self._device_path_lbl.setText(f"Device: {drive}")
+        root = device_root(db_path)
+        self._device_path_lbl.setText(f"Device: {root}")
         self.statusBar().showMessage(
-            f"Pacemaker detected on {drive} — Device Library loaded."
+            f"Pacemaker detected on {root} — Device Library loaded."
         )
 
     # ------------------------------------------------------------------
@@ -2105,14 +2550,13 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def _cleanup_orphaned_device_files(self):
-        """Delete audio files in J:\\.Pacemaker\\Music\\ not referenced in the device DB."""
+        """Delete audio files in <device root>/.Pacemaker/Music not referenced in the device DB."""
         device_db = self._device_panel.db_path
         if not device_db:
             QMessageBox.warning(self, "No Device", "No device database loaded.")
             return
 
-        device_drive = os.path.splitdrive(device_db)[0]
-        music_root = os.path.join(device_drive, os.sep, ".Pacemaker", "Music")
+        music_root = device_music_root(device_db)
         if not os.path.isdir(music_root):
             QMessageBox.information(self, "Clean Up", "No Music folder found on device.")
             return
