@@ -38,7 +38,9 @@ try:
 except ImportError:
     _PREVIEW_OK = False
 
-from core.rekordbox_reader import RekordboxError, RekordboxReader, PlaylistNode, TrackInfo
+from core.rekordbox_reader import (
+    RekordboxError, RekordboxNotFoundError, RekordboxReader, PlaylistNode, TrackInfo,
+)
 from core import logger as _logger
 from ui.style import ACCENT
 
@@ -581,12 +583,13 @@ class FileImportWorker(QObject):
     finished = pyqtSignal(bool, str, list)    # success, message, files that stopped the import
 
     def __init__(self, db_path: str, files: list[str], case_id: "int | None",
-                 add_duplicates: bool = False):
+                 add_duplicates: bool = False, new_case_name: str = ""):
         super().__init__()
         self._db_path = db_path
         self._files = files
         self._case_id = case_id
         self._add_duplicates = add_duplicates
+        self._new_case_name = new_case_name
         self._cancelled = False
 
     def cancel(self) -> None:
@@ -603,6 +606,8 @@ class FileImportWorker(QObject):
             total = len(tracks)
 
             with PacemakerWriter(self._db_path) as writer:
+                if self._new_case_name:
+                    self._case_id = writer.create_case(self._new_case_name)
                 for i, track in enumerate(tracks):
                     if self._cancelled:
                         self.finished.emit(True, f"Import stopped after {i} track(s).", [])
@@ -1424,6 +1429,7 @@ class MainWindow(QMainWindow):
         self._editor_panel.new_case_requested.connect(self._on_new_case_requested)
         self._editor_panel.tracks_dropped_on_case.connect(self._on_tracks_dropped_on_case)
         self._editor_panel.files_dropped_on_case.connect(self._on_files_dropped_on_case)
+        self._editor_panel.files_dropped_on_empty.connect(self._on_files_dropped_on_empty)
 
         # ── Device library panel ──────────────────────────────────────────
         self._device_panel = PacemakerLibraryPanel(
@@ -1481,6 +1487,19 @@ class MainWindow(QMainWindow):
         rb_header.addWidget(reload_btn)
         rb_layout.addLayout(rb_header)
         rb_layout.addWidget(self._tree, stretch=1)
+        file_manager = "Finder" if sys.platform == "darwin" else "File Explorer"
+        self._no_rekordbox_note = QLabel(
+            "No Rekordbox library found.\n\n"
+            "You don't need one to use this app. Drag audio files or folders from "
+            f"{file_manager} onto EDITOR LIBRARY to make a new case, or onto a case to add "
+            "to it. You can also use File → Import from M3U8.\n\n"
+            "If you install Rekordbox later, open it once, then click Reload."
+        )
+        self._no_rekordbox_note.setWordWrap(True)
+        self._no_rekordbox_note.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        self._no_rekordbox_note.setContentsMargins(10, 10, 10, 10)
+        self._no_rekordbox_note.hide()
+        rb_layout.addWidget(self._no_rekordbox_note, stretch=1)
         rb_layout.addWidget(import_btn)
 
         # ── Central track area ────────────────────────────────────────────
@@ -1771,6 +1790,12 @@ class MainWindow(QMainWindow):
             self._player_bar.set_rekordbox_reader(self._rb_reader)
             _logger.log.info("Rekordbox library loaded — %d top-level nodes", len(self._playlist_nodes))
             self.statusBar().showMessage("Rekordbox library loaded.")
+        except RekordboxNotFoundError as e:
+            # Not a fault: the app also works from dropped files and M3U8 playlists
+            _logger.log.info("No Rekordbox library: %s", e)
+            self._tree.hide()
+            self._no_rekordbox_note.show()
+            self.statusBar().showMessage("No Rekordbox library found.")
         except Exception as e:
             _logger.log.error("Could not load Rekordbox: %s", e, exc_info=True)
             title = e.title if isinstance(e, RekordboxError) else "Couldn't Read Rekordbox Library"
@@ -1795,10 +1820,13 @@ class MainWindow(QMainWindow):
         except Exception as e:
             _logger.log.error("Could not reload Rekordbox: %s", e, exc_info=True)
             title = e.title if isinstance(e, RekordboxError) else "Couldn't Read Rekordbox Library"
-            QMessageBox.warning(self, title, f"{e}\n\nThe list hasn't been changed.")
+            unchanged = "" if previous is None else "\n\nThe list hasn't been changed."
+            QMessageBox.warning(self, title, f"{e}{unchanged}")
             return
         self._rb_reader = reader
         self._playlist_nodes = nodes
+        self._no_rekordbox_note.hide()
+        self._tree.show()
         self._tree.load_tree(nodes, ticked)
         self._player_bar.set_rekordbox_reader(reader)
         self._recompute_queue()
@@ -3097,20 +3125,32 @@ class MainWindow(QMainWindow):
         if not db_path:
             QMessageBox.warning(self, "No Database", "Please select an Editor database first.")
             return
-        name, ok = QInputDialog.getText(self, "New Case", "Case name:")
-        name = name.strip()
-        if not ok or not name:
+        name = self._ask_new_case_name(db_path)
+        if not name:
             return
         try:
             with PacemakerWriter(db_path) as writer:
-                if writer.case_name_exists(name):
-                    self._warn_duplicate_case_name(name)
-                    return
                 writer.create_case(name)
             self._load_editor_library()
             self.statusBar().showMessage(f"Created case \"{name}\".")
         except Exception as e:
             QMessageBox.critical(self, "Error", str(e))
+
+    def _ask_new_case_name(self, db_path: str, suggestion: str = "") -> str:
+        """Returns a name no case is using, or "" if the user cancelled or chose a taken one."""
+        name, ok = QInputDialog.getText(self, "New Case", "Case name:", text=suggestion)
+        name = name.strip()
+        if not ok or not name:
+            return ""
+        try:
+            with PacemakerWriter(db_path) as writer:
+                if writer.case_name_exists(name):
+                    self._warn_duplicate_case_name(name)
+                    return ""
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            return ""
+        return name
 
     def _on_tracks_dropped_on_case(self, case_id: int, locations: list) -> None:
         """Handle tracks dragged from the central table onto a case in the side list."""
@@ -3145,6 +3185,10 @@ class MainWindow(QMainWindow):
         """Handle files/folders dragged from Explorer directly onto a case."""
         self._import_dropped_files(paths, case_id)
 
+    def _on_files_dropped_on_empty(self, paths: list) -> None:
+        """Handle files/folders dragged below the cases, which makes a new case from them."""
+        self._import_dropped_files(paths, None, make_case=True)
+
     def _on_central_files_dropped(self, paths: list) -> None:
         """
         Handle files/folders dragged from Explorer onto the central table.
@@ -3158,7 +3202,7 @@ class MainWindow(QMainWindow):
             return
         self._import_dropped_files(paths, self._track_table_case_id)
 
-    def _import_dropped_files(self, paths: list, case_id: "int | None") -> None:
+    def _import_dropped_files(self, paths: list, case_id: "int | None", make_case: bool = False) -> None:
         db_path = self._panel.db_path
         if not db_path:
             QMessageBox.warning(self, "No Database", "Please select an Editor database first.")
@@ -3172,8 +3216,16 @@ class MainWindow(QMainWindow):
                 self.statusBar().showMessage("No audio files found in what you dropped.")
             return
 
+        new_case_name = ""
         add_duplicates = False
-        if case_id is not None:
+        if make_case:
+            folder = paths[0] if len(paths) == 1 and os.path.isdir(paths[0]) else ""
+            new_case_name = self._ask_new_case_name(db_path, os.path.basename(folder.rstrip("/\\")))
+            if not new_case_name:
+                return
+            if _has_repeats(files):
+                add_duplicates = _ask_add_duplicates(self)
+        elif case_id is not None:
             try:
                 with PacemakerWriter(db_path) as writer:
                     in_case = writer.get_case_track_locations(case_id)
@@ -3192,7 +3244,7 @@ class MainWindow(QMainWindow):
         self._import_progress_dlg.show()
 
         self._import_thread = QThread()
-        self._import_worker = FileImportWorker(db_path, files, case_id, add_duplicates)
+        self._import_worker = FileImportWorker(db_path, files, case_id, add_duplicates, new_case_name)
         self._import_worker.moveToThread(self._import_thread)
         self._import_thread.started.connect(self._import_worker.run)
 

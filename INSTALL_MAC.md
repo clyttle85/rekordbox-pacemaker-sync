@@ -10,7 +10,7 @@ five minutes. For a full walkthrough of installing and using the app, get the
   at the top left of the screen, then **About This Mac**. If yours is older, update
   it under **System Settings** → **General** → **Software Update**. The app won't
   run on a Mac that can't update this far.
-- Rekordbox 6 or 7, installed and opened at least once.
+- Rekordbox 6 or 7, installed and opened at least once, if you want to import your playlists from it. Without it, you can drag music in from Finder.
 - To put music on your Pacemaker: the Pacemaker and its USB cable.
 
 > The Mac version is new and hasn't yet been tried widely. If something doesn't
@@ -91,11 +91,11 @@ To put music on your Pacemaker:
 
 ## Troubleshooting
 
-### "Rekordbox Library Not Found"
+### "No Rekordbox library found"
 
-Install Rekordbox if you haven't, and open it once so it creates your library.
-Then quit and reopen this app. You can still add music without Rekordbox, using
-**File → Import from M3U8** or by dragging audio files into the library.
+This is fine if you don't use Rekordbox: drag music in from Finder, or use
+**File → Import from M3U8**. If you do use it, open Rekordbox once so it creates
+your library, then click **Reload** at the top of Rekordbox Library.
 
 ### "Couldn't Read Rekordbox Library" or "Couldn't Unlock Rekordbox Library"
 
