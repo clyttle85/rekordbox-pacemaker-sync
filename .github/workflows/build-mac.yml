@@ -10,9 +10,6 @@ on:
   push:
     tags:
       - "v*"
-    # TEMPORARY: lets the new workflow run from this branch. Remove before merging.
-    branches:
-      - mac-distribution
 
 permissions:
   contents: read
@@ -91,11 +88,19 @@ jobs:
           lipo -archs "$APP_BINARY" | tr ' ' '\n' | grep -qx "${{ matrix.machine }}"
           vtool -show-build "$APP_BINARY" | grep -E 'minos|version ' || true
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist"
-          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP_PATH/Contents/Info.plist" || true
-          # The real floor is the newest requirement among the bundled libraries
-          find "$APP_PATH/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -path '*.framework/Versions/*' \) \
+          # The real floor is the newest requirement among the bundled libraries.
+          # If it passes what we declare, older Macs would crash at launch.
+          declared="$(/usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP_PATH/Contents/Info.plist")"
+          required="$(find "$APP_PATH/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -path '*.framework/Versions/*' \) \
             | while IFS= read -r file; do vtool -show-build "$file" 2>/dev/null || true; done \
-            | awk '$1 == "minos" { print $2 }' | sort -V | uniq -c
+            | awk '$1 == "minos" { print $2 }' | sort -V)"
+          printf '%s\n' "$required" | uniq -c
+          floor="$(printf '%s\n' "$required" | tail -1)"
+          echo "Declared minimum macOS: $declared. Required by bundled libraries: $floor."
+          if [ "$(printf '%s\n%s\n' "$declared" "$floor" | sort -V | tail -1)" != "$declared" ]; then
+            echo "::error::Bundled libraries need macOS $floor but the app declares $declared. Update LSMinimumSystemVersion in the spec and INSTALL_MAC.md."
+            exit 1
+          fi
 
       # Optional: needs an Apple Developer ID. Skipped until the secrets are set.
       - name: Sign app bundle

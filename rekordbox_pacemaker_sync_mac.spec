@@ -95,6 +95,9 @@ app = BUNDLE(
         'CFBundleShortVersionString': APP_VERSION,
         'CFBundleVersion': APP_VERSION,
         'NSHumanReadableCopyright': 'Chris Lyttle',
+        # Older macOS then shows a clear message rather than crashing at launch.
+        # Set by the bundled Qt; CI fails if a dependency raises it above this.
+        'LSMinimumSystemVersion': '14.4',
         # Shown in the macOS permission prompts for these locations
         'NSRemovableVolumesUsageDescription':
             'Reads and writes your music library on the connected Pacemaker.',

@@ -28,7 +28,9 @@ check the current labels in the
 A build fails unless all of these pass, on both architectures:
 
 1. Every module in `core/` and `ui/` imports from source.
-2. The bundle's binary is the expected architecture.
+2. The bundle's binary is the expected architecture, and no bundled library needs
+   a newer macOS than `LSMinimumSystemVersion` in the spec (currently 14.4, set by
+   the PyQt6 wheels). If this fails, update the spec and INSTALL_MAC.md.
 3. `RekordboxPacemakerSync --selftest` passes in the bundle. It creates and reads an
    encrypted `master.db` through the bundled pyrekordbox and SQLCipher, checks the
    Qt Multimedia backend, then opens the main window for a few seconds. See
