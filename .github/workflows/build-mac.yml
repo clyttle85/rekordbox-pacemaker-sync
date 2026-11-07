@@ -35,6 +35,9 @@ jobs:
     env:
       APP_PATH: dist/RekordboxPacemakerSync.app
       APP_BINARY: dist/RekordboxPacemakerSync.app/Contents/MacOS/RekordboxPacemakerSync
+      # Signing and notarization run only once these repo secrets are set.
+      # See BUILD_INSTALLER_MAC.md.
+      HAS_APPLE_SECRETS: ${{ secrets.APPLE_CERT_P12 != '' && secrets.APPLE_CERT_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_TEAM_ID != '' && secrets.APPLE_APP_PASSWORD != '' }}
     steps:
       - uses: actions/checkout@v7
 
@@ -94,6 +97,33 @@ jobs:
             | xargs -0 -n 50 vtool -show-build 2>/dev/null \
             | awk '$1 == "minos" { print $2 }' | sort -V | uniq -c
 
+      # Optional: needs an Apple Developer ID. Skipped until the secrets are set.
+      - name: Sign app bundle
+        if: env.HAS_APPLE_SECRETS == 'true'
+        env:
+          APPLE_CERT_P12: ${{ secrets.APPLE_CERT_P12 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          keychain_password="$(uuidgen)"
+          printf '%s' "$APPLE_CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p "$keychain_password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$keychain_password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" -P "$APPLE_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$keychain_password" "$keychain"
+          security list-keychains -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | grep "Developer ID Application.*($APPLE_TEAM_ID)" | head -1 | awk '{print $2}')"
+          test -n "$identity"
+          echo "SIGNING_IDENTITY=$identity" >> "$GITHUB_ENV"
+          codesign --force --deep --timestamp --options runtime \
+            --entitlements packaging/mac/entitlements.plist \
+            --sign "$identity" "$APP_PATH"
+          codesign --verify --deep --strict --verbose=2 "$APP_PATH"
+
       - name: "Smoke test: built app self-check"
         env:
           QT_QPA_PLATFORM: offscreen
@@ -131,6 +161,20 @@ jobs:
           done
           exit 1
 
+      # Optional: needs an Apple Developer ID. Skipped until the secrets are set.
+      - name: Sign and notarize DMG
+        if: env.HAS_APPLE_SECRETS == 'true'
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          codesign --force --timestamp --sign "$SIGNING_IDENTITY" "dist/$DMG_NAME"
+          xcrun notarytool submit "dist/$DMG_NAME" --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" --password "$APPLE_APP_PASSWORD" --wait --timeout 30m
+          xcrun stapler staple "dist/$DMG_NAME"
+          xcrun stapler validate "dist/$DMG_NAME"
+
       - name: "Smoke test: app inside the DMG"
         env:
           QT_QPA_PLATFORM: offscreen
@@ -144,6 +188,10 @@ jobs:
             "$mount_point/RekordboxPacemakerSync.app/Contents/MacOS/RekordboxPacemakerSync" --selftest || status=$?
           hdiutil detach "$mount_point" || hdiutil detach -force "$mount_point"
           exit "$status"
+
+      - name: Remove signing keychain
+        if: always() && env.HAS_APPLE_SECRETS == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true
 
       - uses: actions/upload-artifact@v7
         with:

@@ -102,3 +102,57 @@ pyinstaller rekordbox_pacemaker_sync_mac.spec
 | `icon.icns` | App icon (generated from `D:\Downloads\icon.png` via Pillow, on Windows) |
 | `rekordbox_pacemaker_sync_mac.spec` | PyInstaller build config for macOS |
 | `dist/RekordboxPacemakerSync.app` | The built app — run it directly |
+
+## Turning on code signing and notarization
+
+Unsigned builds work, but every user has to approve the app by hand the first
+time (see [INSTALL_MAC.md](INSTALL_MAC.md)). Signing and notarizing removes that
+step. The workflow already contains the steps, and they run automatically once
+all five secrets below exist. Until then they're skipped and the build stays
+unsigned. **These steps have never been run**, so expect to check the first
+signed build carefully.
+
+You need an [Apple Developer Program](https://developer.apple.com/programs/)
+membership ($99/year). None of this needs a Mac:
+
+1. **Create a signing key and request** (on Windows, using Git Bash's `openssl`):
+
+   ```bash
+   openssl req -new -newkey rsa:2048 -nodes -keyout developer_id.key \
+     -out developer_id.csr -subj "/emailAddress=you@example.com/CN=Your Name/C=US"
+   ```
+
+2. **Get the certificate.** Sign in to
+   [Certificates, Identifiers & Profiles](https://developer.apple.com/account/resources/certificates/list),
+   add a **Developer ID Application** certificate, upload `developer_id.csr`, and
+   download the resulting `.cer`. Only the account holder can create this type.
+
+3. **Bundle them into a `.p12`.** `-legacy` matters because the macOS keychain
+   can't import OpenSSL 3's default encryption:
+
+   ```bash
+   openssl x509 -inform der -in developerID_application.cer -out developer_id.pem
+   openssl pkcs12 -export -legacy -inkey developer_id.key -in developer_id.pem \
+     -out developer_id.p12
+   ```
+
+4. **Create an app-specific password** at [account.apple.com](https://account.apple.com)
+   under Sign-In and Security.
+
+5. **Add the repo secrets** (Settings → Secrets and variables → Actions):
+
+   | Secret | Value |
+   |---|---|
+   | `APPLE_CERT_P12` | The `.p12`, base64-encoded: `base64 -w0 developer_id.p12` |
+   | `APPLE_CERT_PASSWORD` | The password chosen when exporting the `.p12` |
+   | `APPLE_ID` | Your Apple account email |
+   | `APPLE_TEAM_ID` | The 10-character Team ID from your Apple Developer account |
+   | `APPLE_APP_PASSWORD` | The app-specific password from step 4 |
+
+6. **Run the workflow.** Check the "Sign app bundle" and "Sign and notarize DMG"
+   steps ran rather than being skipped. The hardened-runtime exceptions the app
+   needs are in `packaging/mac/entitlements.plist`, and the signed app goes through
+   the same smoke tests, so a missing entitlement fails the build.
+
+7. **Delete the private key files** from your computer once the secrets are saved,
+   and update INSTALL_MAC.md to remove the "Open Anyway" steps.
