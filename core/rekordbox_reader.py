@@ -5,17 +5,28 @@ tree structure for the UI to consume.
 """
 
 from __future__ import annotations
+import os
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
 _IMPORT_ERROR: str = ""
 try:
-    from pyrekordbox import Rekordbox6Database as MasterDatabase
-    from pyrekordbox.db6.tables import DjmdPlaylist
+    # pyrekordbox 0.5 renamed pyrekordbox.db6 to pyrekordbox.masterdb and requires
+    # Python 3.11+, so which branch runs depends on the interpreter: Windows builds
+    # on Python 3.9 stay on 0.4.x. See requirements.txt for the supported range.
+    try:
+        from pyrekordbox.masterdb import MasterDatabase
+        from pyrekordbox.masterdb.models import DjmdContent
+    except ModuleNotFoundError as _e:
+        if _e.name != "pyrekordbox.masterdb":
+            raise
+        from pyrekordbox import Rekordbox6Database as MasterDatabase
+        from pyrekordbox.db6.tables import DjmdContent
     PYREKORDBOX_AVAILABLE = True
 except Exception as _e:
     PYREKORDBOX_AVAILABLE = False
-    _IMPORT_ERROR = str(_e)
+    _IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 # Attribute values from pyrekordbox PlaylistType enum
@@ -25,6 +36,74 @@ SMART_PLAYLIST_TYPE = 4
 
 # Rekordbox special playlist IDs to skip
 SPECIAL_IDS = {"100000", "200000"}
+
+
+class RekordboxError(Exception):
+    """A problem opening the Rekordbox library, with a message written for end users."""
+    title = "Couldn't Read Rekordbox Library"
+
+
+class RekordboxUnavailableError(RekordboxError):
+    title = "Rekordbox Support Failed to Load"
+
+
+class RekordboxNotFoundError(RekordboxError):
+    title = "Rekordbox Library Not Found"
+
+
+class RekordboxUnlockError(RekordboxError):
+    title = "Couldn't Unlock Rekordbox Library"
+
+
+def _default_master_db() -> str:
+    """Rekordbox's standard master.db location, wherever the app itself is installed."""
+    if sys.platform == "darwin":
+        base = os.path.expanduser("~/Library")
+    else:
+        base = os.environ.get("APPDATA", "")
+    return os.path.join(base, "Pioneer", "rekordbox", "master.db")
+
+
+def _unavailable_error(detail: object) -> RekordboxUnavailableError:
+    hint = "" if getattr(sys, "frozen", False) else (
+        "\n\nTry: pip install -r requirements.txt"
+    )
+    return RekordboxUnavailableError(
+        f"The Rekordbox reader (pyrekordbox) could not be loaded.\n\n"
+        f"Error: {detail}{hint}"
+    )
+
+
+def _open_master_db(db_path: Optional[str]):
+    """
+    Open master.db, or raise a RekordboxError explaining why it can't be.
+
+    pyrekordbox decrypts the database with a key built into the package, so there
+    is no per-machine setup step: this works first time on any Rekordbox 6/7.
+    """
+    if not PYREKORDBOX_AVAILABLE:
+        raise _unavailable_error(_IMPORT_ERROR)
+
+    # With no explicit path, let pyrekordbox find the library from the Rekordbox
+    # install. If that fails, still try the default location before giving up.
+    candidates = [db_path] if db_path else [None, _default_master_db()]
+    not_found: Exception | None = None
+    for candidate in candidates:
+        try:
+            return MasterDatabase(path=candidate) if candidate else MasterDatabase()
+        except (FileNotFoundError, KeyError) as e:
+            not_found = e
+        except ImportError as e:   # sqlcipher3 missing or its library failed to load
+            raise _unavailable_error(f"{type(e).__name__}: {e}") from e
+        except Exception as e:
+            raise RekordboxError(
+                f"Your Rekordbox library was found, but could not be opened.\n\nDetails: {e}"
+            ) from e
+    raise RekordboxNotFoundError(
+        "No Rekordbox library was found on this computer.\n\n"
+        "Install Rekordbox 6 or 7 and open it once so it creates your library, "
+        f"then reopen this app.\n\nDetails: {not_found}"
+    ) from not_found
 
 
 @dataclass
@@ -68,13 +147,28 @@ class TrackInfo:
 
 class RekordboxReader:
     def __init__(self, db_path: Optional[str] = None):
-        if not PYREKORDBOX_AVAILABLE:
-            raise RuntimeError(
-                f"pyrekordbox could not be imported.\n\n"
-                f"Error: {_IMPORT_ERROR}\n\n"
-                f"Try: pip install pyrekordbox sqlcipher3-wheels"
-            )
-        self._db = MasterDatabase(path=db_path) if db_path else MasterDatabase()
+        self._db = _open_master_db(db_path)
+        self._check_readable()
+
+    def _check_readable(self) -> None:
+        """Connections are lazy, so a wrong key would otherwise only fail on first use."""
+        from sqlalchemy.exc import DatabaseError
+        try:
+            self._db.get_playlist().first()
+        except DatabaseError as e:
+            self._db.close()
+            if "not a database" in str(e):
+                raise RekordboxUnlockError(
+                    "Your Rekordbox library was found, but could not be unlocked. A newer "
+                    "version of Rekordbox may have changed how it protects the library: "
+                    "check for an update to this app.\n\n"
+                    f"Details: {e.orig}"
+                ) from e
+            raise RekordboxError(
+                "Your Rekordbox library was found, but could not be read. If Rekordbox "
+                "is open, close it and reopen this app.\n\n"
+                f"Details: {e.orig}"
+            ) from e
 
     def close(self):
         self._db.close()
@@ -147,7 +241,6 @@ class RekordboxReader:
             if content is None:
                 try:
                     import sqlalchemy
-                    from pyrekordbox.db6.tables import DjmdContent
                     content = self._db.query(DjmdContent).filter(
                         sqlalchemy.func.lower(DjmdContent.FolderPath)
                         == location.lower()
@@ -175,7 +268,7 @@ class RekordboxReader:
         """Return ordered list of TrackInfo for all tracks in a playlist."""
         import os
         result = self._db.get_playlist(ID=playlist_id)
-        # pyrekordbox 0.4.4 returns the object directly when a filter arg is given
+        # pyrekordbox 0.4.4 and 0.5.0 both return the object directly when ID= is given
         if hasattr(result, "one_or_none"):
             pl = result.one_or_none()
         else:

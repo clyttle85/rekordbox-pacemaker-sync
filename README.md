@@ -2,6 +2,12 @@
 
 A PyQt6 desktop app for syncing playlists from **Rekordbox** to the **Tonium Pacemaker** hardware DJ device.
 
+## Download for Mac
+
+Get the `.dmg` for your Mac from the [Releases page](https://github.com/clyttle85/rekordbox-pacemaker-sync/releases/latest), then follow the step-by-step **[Mac install guide](INSTALL_MAC.md)**. It needs macOS 14.4 or newer, and no technical knowledge.
+
+## What it does
+
 Check playlists in your Rekordbox library, sync them into an Editor library, then push them to a connected Pacemaker — the app copies the audio files and writes the device's `music.db` for you.
 
 ```
@@ -21,13 +27,12 @@ Rekordbox Library  →  Editor Library  →  Device Library
 - Dark theme UI
 - Repair tool for fixing broken device track paths (e.g. after moving files)
 - Import playlists directly from an M3U8 file
-- Orphaned device file cleanup and optional debug logging (File → Debug menu)
+- Orphaned device file cleanup and optional debug logging (Debug menu)
 
 ## Requirements
 
-- Windows or macOS (ported to Mac in this session — see the macOS note below;
-  not yet verified on real macOS hardware)
-- Python 3.9
+- Windows or macOS (see the macOS note below)
+- Python 3.9 or newer, if running from source
 - Rekordbox 6+ (for the encrypted `master.db` that this app reads)
 - A Tonium Pacemaker connected as a removable drive, for pushing to a device
 
@@ -37,12 +42,11 @@ Rekordbox Library  →  Editor Library  →  Device Library
 # Install dependencies
 pip install -r requirements.txt
 
-# One-time: let pyrekordbox find/derive the decryption key for your Rekordbox master.db
-python -m pyrekordbox setup
-
 # Run
 python main.py
 ```
+
+On a Mac, you can double-click `setup_mac.command` instead, then `run_mac.command` for later launches.
 
 Editor and Device database paths are auto-detected on startup, and the
 Editor database is created fresh (with the full Pacemaker schema) if none is
@@ -61,18 +65,16 @@ found — no need to have ever installed the real Tonium Editor software:
 
 The Pacemaker Editor software is long dead on modern macOS, which left Mac
 users with no way to get music onto the device at all. This app now runs on
-macOS too — ported in the same session that built the Windows installer, but
-**not yet run on real macOS hardware**. See
-[BUILD_INSTALLER_MAC.md](BUILD_INSTALLER_MAC.md) if you hit anything that
-needs fixing on first build/run.
+macOS too. Automated builds launch and pass self-checks on Apple Silicon and
+Intel, but it **hasn't yet been tested on a real Mac with a real Rekordbox
+library and Pacemaker**.
 
 ## Building a standalone app
 
 - **Windows**: see [BUILD_INSTALLER.md](BUILD_INSTALLER.md) for the
   PyInstaller + Inno Setup process. Produces an installer exe.
-- **macOS**: see [BUILD_INSTALLER_MAC.md](BUILD_INSTALLER_MAC.md). Produces a
-  `.app` you can run directly — no install step, no need to move it into
-  `/Applications`.
+- **macOS**: see [BUILD_INSTALLER_MAC.md](BUILD_INSTALLER_MAC.md). GitHub Actions
+  builds a drag-to-install DMG for Apple Silicon and for Intel.
 
 ## Project structure
 
@@ -103,7 +105,7 @@ See [CLAUDE.md](CLAUDE.md) for a full technical deep-dive (database schemas, syn
 ## Roadmap
 
 - ~~Windows installer distribution~~ — done, see [BUILD_INSTALLER.md](BUILD_INSTALLER.md).
-- macOS port — code changes are done (this app now runs on Mac in principle), but **not yet built, run, or tested on real macOS hardware**. First build will likely need a round of fixes (SQLCipher install, PyInstaller hidden imports). See [BUILD_INSTALLER_MAC.md](BUILD_INSTALLER_MAC.md).
-- Code signing + notarization for the macOS build, so it doesn't trip Gatekeeper's "unidentified developer" warning (needs an Apple Developer ID).
+- macOS: test on a real Mac with a real Rekordbox library and Pacemaker. Builds and automated self-checks already pass, see [BUILD_INSTALLER_MAC.md](BUILD_INSTALLER_MAC.md).
+- Turn on code signing + notarization for the macOS build, so users skip Gatekeeper's warning. The CI steps are ready, but it needs an Apple Developer ID. See [BUILD_INSTALLER_MAC.md](BUILD_INSTALLER_MAC.md).
 - Split `disc_number` / `number_of_discs` correctly in `m3u8_reader.py` (currently both read from the same tag)
 - Batch DB transactions in `pacemaker_writer.py` for large syncs

@@ -25,7 +25,7 @@ _IS_MAC = sys.platform == "darwin"
 _IS_WINDOWS = sys.platform.startswith("win")
 
 
-def _editor_db_candidate() -> str:
+def default_editor_db_path() -> str:
     """Where the Editor music.db lives (or should be created) on this OS."""
     if _IS_MAC:
         return os.path.join(
@@ -38,7 +38,7 @@ def _editor_db_candidate() -> str:
 
 def find_editor_db() -> str:
     """Return the Pacemaker Editor database path if it exists, else empty string."""
-    candidate = _editor_db_candidate()
+    candidate = default_editor_db_path()
     return candidate if os.path.isfile(candidate) else ""
 
 
@@ -52,7 +52,7 @@ def ensure_editor_db() -> str:
     existing = find_editor_db()
     if existing:
         return existing
-    candidate = _editor_db_candidate()
+    candidate = default_editor_db_path()
     os.makedirs(os.path.dirname(candidate), exist_ok=True)
     create_empty_editor_db(candidate)
     return candidate

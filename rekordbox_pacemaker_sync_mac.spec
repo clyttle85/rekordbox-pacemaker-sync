@@ -8,7 +8,15 @@
 # is never at risk from Mac-specific changes.
 from __future__ import annotations
 
+import os
+
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
+
+# Set by CI from the release tag. Apple only accepts dotted numbers here, so
+# "0.0.0" marks a build that didn't come from a tagged release.
+APP_VERSION = os.environ.get('APP_VERSION', '0.0.0')
 
 a = Analysis(
     ['main.py'],
@@ -18,11 +26,12 @@ a = Analysis(
         ('icon.icns', '.'),
     ],
     hiddenimports=[
-        'pyrekordbox',
-        'pyrekordbox.db6',
-        'pyrekordbox.db6.tables',
-        'pyrekordbox.db6.database',
+        # Covers either supported layout (0.4: pyrekordbox.db6, 0.5: .masterdb)
+        *collect_submodules('pyrekordbox'),
+        'sqlcipher3',
+        'sqlcipher3.dbapi2',
         'sqlalchemy.dialects.sqlite',
+        'sqlalchemy.dialects.sqlite.pysqlcipher',
         'sqlalchemy.pool',
         'mutagen',
         'mutagen.mp3',
@@ -55,7 +64,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     console=False,
     disable_windowed_traceback=False,
     argv_emulation=False,
@@ -71,7 +80,7 @@ coll = COLLECT(
     a.zipfiles,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='RekordboxPacemakerSync',
 )
@@ -83,8 +92,20 @@ app = BUNDLE(
     bundle_identifier='com.chrislyttle.rekordboxpacemakersync',
     info_plist={
         'NSHighResolutionCapable': True,
-        'CFBundleShortVersionString': '1.0.0',
-        'CFBundleVersion': '1.0.0',
+        'CFBundleShortVersionString': APP_VERSION,
+        'CFBundleVersion': APP_VERSION,
         'NSHumanReadableCopyright': 'Chris Lyttle',
+        # Older macOS then shows a clear message rather than crashing at launch.
+        # Set by the bundled Qt; CI fails if a dependency raises it above this.
+        'LSMinimumSystemVersion': '14.4',
+        # Shown in the macOS permission prompts for these locations
+        'NSRemovableVolumesUsageDescription':
+            'Reads and writes your music library on the connected Pacemaker.',
+        'NSDocumentsFolderUsageDescription':
+            'Reads audio files in your Documents folder to sync them to the Pacemaker.',
+        'NSDownloadsFolderUsageDescription':
+            'Reads audio files in your Downloads folder to sync them to the Pacemaker.',
+        'NSDesktopFolderUsageDescription':
+            'Reads audio files on your Desktop to sync them to the Pacemaker.',
     },
 )

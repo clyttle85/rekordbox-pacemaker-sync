@@ -1,8 +1,10 @@
 PyQt6>=6.4.0
-pyrekordbox>=0.3.0
+# 0.4.x (Python 3.9+) and 0.5.x (Python 3.11+) are both supported, see
+# core/rekordbox_reader.py. pip picks whichever suits the running Python.
+pyrekordbox>=0.4.4,<0.6
 mutagen>=1.47.0
 sqlalchemy>=2.0.0
 
-# SQLCipher support for reading Rekordbox's encrypted master.db — the install
-# path differs per OS, see README.md's Setup section.
-sqlcipher3-wheels; sys_platform == "win32"
+# SQLCipher support for reading Rekordbox's encrypted master.db. Publishes
+# prebuilt wheels for Windows and macOS (arm64 and Intel).
+sqlcipher3-wheels
