@@ -1,7 +1,8 @@
 # Installing Rekordbox Pacemaker Sync on a Mac
 
 You don't need the Terminal or any technical knowledge for this. It takes about
-five minutes.
+five minutes. For a full walkthrough of installing and using the app, get the
+[beginner's guide (PDF)](https://github.com/clyttle85/rekordbox-pacemaker-sync/raw/main/Rekordbox_Pacemaker_Sync_Mac_Guide.pdf).
 
 **You'll need:**
 
