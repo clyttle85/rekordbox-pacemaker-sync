@@ -333,7 +333,7 @@ class _CentralTrackTable(QTableWidget):
 from core.pacemaker_writer import PacemakerWriter
 from core import sync_state
 from core.device_finder import (
-    find_device_db, ensure_editor_db,
+    find_device_db, ensure_editor_db, default_editor_db_path,
     device_root, device_music_root, is_on_device,
 )
 from core.m3u8_reader import load_m3u8_tracks
@@ -831,10 +831,9 @@ class RepairDeviceDbDialog(QDialog):
             if basename and basename in file_index:
                 # Convert the Windows path we found back to a pmdb location string
                 win_path = file_index[basename]
-                # Try to express as /pmdb_tracks/... if it's inside .Pacemaker\Music
-                pacemaker_music = os.path.join(device_drive, os.sep, ".Pacemaker", "Music")
-                if win_path.startswith(pacemaker_music):
-                    rel = win_path[len(pacemaker_music):].lstrip(os.sep).replace(os.sep, "/")
+                # Try to express as /pmdb_tracks/... if it's inside .Pacemaker/Music
+                if win_path.startswith(music_root):
+                    rel = win_path[len(music_root):].lstrip(os.sep).replace(os.sep, "/")
                     new_loc = f"/pmdb_tracks/{rel}"
                 else:
                     new_loc = win_path  # fallback: store as-is
@@ -2472,15 +2471,9 @@ class MainWindow(QMainWindow):
         if self._device_panel.db_path:
             return  # Already have a device loaded
 
-        import ctypes
-        bitmask = ctypes.windll.kernel32.GetLogicalDrives()
-        for i in range(26):
-            if bitmask & (1 << i):
-                letter = chr(ord("A") + i)
-                db_path = rf"{letter}:\.Pacemaker\music.db"
-                if os.path.exists(db_path):
-                    self._auto_load_device(db_path)
-                    return
+        db_path = find_device_db()
+        if db_path:
+            self._auto_load_device(db_path)
 
     def _auto_load_device(self, db_path: str) -> None:
         """Called when a Pacemaker drive is detected. Loads its library."""
@@ -2671,12 +2664,7 @@ class MainWindow(QMainWindow):
 
     def _toggle_debug_logging(self, checked: bool) -> None:
         if checked:
-            editor_db = self._panel.db_path
-            if editor_db:
-                log_dir = os.path.dirname(editor_db)
-            else:
-                log_dir = os.path.expandvars(r"%APPDATA%\Tonium\Pacemaker")
-            log_path = os.path.join(log_dir, "rb_pm_sync.log")
+            log_path = self._debug_log_path()
             _logger.enable(log_path)
             self._open_log_action.setEnabled(True)
             self.statusBar().showMessage(f"Debug logging enabled → {log_path}")
@@ -2688,14 +2676,15 @@ class MainWindow(QMainWindow):
             self._open_log_action.setEnabled(False)
             self.statusBar().showMessage("Debug logging disabled.")
 
+    def _debug_log_path(self) -> str:
+        """The log sits next to the Editor DB, or its default location if none is loaded."""
+        editor_db = self._panel.db_path or default_editor_db_path()
+        return os.path.join(os.path.dirname(editor_db), "rb_pm_sync.log")
+
     def _open_log_file(self) -> None:
         from PyQt6.QtCore import QUrl
         from PyQt6.QtGui import QDesktopServices
-        editor_db = self._panel.db_path
-        log_dir = os.path.dirname(editor_db) if editor_db else os.path.expandvars(
-            r"%APPDATA%\Tonium\Pacemaker"
-        )
-        log_path = os.path.join(log_dir, "rb_pm_sync.log")
+        log_path = self._debug_log_path()
         if os.path.exists(log_path):
             QDesktopServices.openUrl(QUrl.fromLocalFile(log_path))
         else:
