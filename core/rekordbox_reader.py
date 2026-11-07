@@ -104,7 +104,7 @@ def _open_master_db(db_path: Optional[str]):
     raise RekordboxNotFoundError(
         "No Rekordbox library was found on this computer.\n\n"
         "Install Rekordbox 6 or 7 and open it once so it creates your library, "
-        f"then reopen this app.\n\nDetails: {not_found}"
+        f"then click Reload.\n\nDetails: {not_found}"
     ) from not_found
 
 

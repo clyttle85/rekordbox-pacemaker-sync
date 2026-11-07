@@ -73,6 +73,7 @@ class _DroppableCaseList(QListWidget):
 
     tracks_dropped_on_case = pyqtSignal(int, list)   # case_id, list[str locations]
     files_dropped_on_case = pyqtSignal(int, list)    # case_id, list[str paths]
+    files_dropped_on_empty = pyqtSignal(list)        # list[str paths], dropped below the cases
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -109,11 +110,17 @@ class _DroppableCaseList(QListWidget):
     def dropEvent(self, event):
         self._set_hover_row(-1)
         item = self.itemAt(event.position().toPoint())
+        mime = event.mimeData()
         if item is None:
-            event.ignore()
+            if mime.hasUrls() and not mime.hasFormat(MIME_LOCATIONS):
+                paths = [url.toLocalFile() for url in mime.urls() if url.isLocalFile()]
+                if paths:
+                    self.files_dropped_on_empty.emit(paths)
+                event.acceptProposedAction()
+            else:
+                event.ignore()
             return
         case_id = item.data(Qt.ItemDataRole.UserRole)
-        mime = event.mimeData()
         if mime.hasFormat(MIME_LOCATIONS):
             locations = bytes(mime.data(MIME_LOCATIONS)).decode("utf-8").split("\n")
             locations = [loc for loc in locations if loc]
@@ -145,6 +152,7 @@ class PacemakerLibraryPanel(QWidget):
     new_case_requested = pyqtSignal()             # "New Case" button clicked
     tracks_dropped_on_case = pyqtSignal(int, list)  # case_id, list[str locations]
     files_dropped_on_case = pyqtSignal(int, list)   # case_id, list[str paths]
+    files_dropped_on_empty = pyqtSignal(list)       # list[str paths], to make a new case
 
     def __init__(
         self,
@@ -263,6 +271,7 @@ class PacemakerLibraryPanel(QWidget):
             self._list = _DroppableCaseList()
             self._list.tracks_dropped_on_case.connect(self.tracks_dropped_on_case)
             self._list.files_dropped_on_case.connect(self.files_dropped_on_case)
+            self._list.files_dropped_on_empty.connect(self.files_dropped_on_empty)
         else:
             self._list = QListWidget()
         self._list.setIconSize(QSize(14, 12))

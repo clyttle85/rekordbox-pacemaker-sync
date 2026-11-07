@@ -220,6 +220,10 @@ Cases can be renamed manually in the Editor Library panel (double-click or Renam
 
 **Duplicates:** adding a track to a case it's already in, by any route, shows `DUPLICATES_PROMPT` with Add and Skip.
 
+**Without Rekordbox:** the app works fully without it. `RekordboxNotFoundError` isn't treated as a fault: `_load_rekordbox` shows no popup and replaces the tree with a note on how to add music. Reload brings the tree back once a library exists. Other `RekordboxError`s, such as a library that can't be unlocked, still warn. Waveforms need Rekordbox, so they're blank without it.
+
+**Dropping files:** onto a case adds to it; onto the empty space in the Editor Library makes a new case, asking for its name, and the case is only created once the files pass their checks; onto the track table adds to the open case or, in All Tracks, to the library without a case.
+
 **Rekordbox → Editor** (`_confirm_and_sync`): checked playlists are read, confirmed, and added as new cases by `SyncWorker`. The tree then unchecks. Importing again makes a second case, suffixed `_2`, and refreshes details of existing tracks. A track whose file has moved or been renamed has a new location, so it counts as a new track. File → Reload Rekordbox Library picks up new playlists and keeps ticks.
 
 **Deleting cases** is a manual action via the Delete button in either library panel. Multi-select supported. Single confirmation dialog lists all names. Device deletes back up the DB first. Unassigned tracks can be removed from the library with the delete key in All Tracks.

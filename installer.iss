@@ -1,11 +1,11 @@
 [Setup]
 AppName=Rekordbox Pacemaker Sync
-AppVersion=0.9.0
+AppVersion=0.9.1
 AppPublisher=Chris Lyttle
 AppPublisherURL=
 DefaultDirName={autopf}\RekordboxPacemakerSync
 DefaultGroupName=Rekordbox Pacemaker Sync
-OutputBaseFilename=RekordboxPacemakerSync-0.9.0-windows-setup
+OutputBaseFilename=RekordboxPacemakerSync-0.9.1-windows-setup
 OutputDir=dist
 SetupIconFile=icon.ico
 UninstallDisplayIcon={app}\RekordboxPacemakerSync.exe

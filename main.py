@@ -17,8 +17,7 @@ def _selftest(app: QApplication) -> int:
     import traceback
     from core.selftest import run_app_checks
 
-    # A modal dialog would hang a headless run. CI machines have no Rekordbox
-    # library, so the "not found" warning is expected here.
+    # A modal dialog would hang a headless run, so print any message instead.
     for name in ("information", "warning", "critical"):
         setattr(QMessageBox, name, staticmethod(lambda _parent, title, text, *_a, **_k: print(
             f"[selftest] {title}: {text!a}", flush=True   # !a: Windows consoles aren't UTF-8

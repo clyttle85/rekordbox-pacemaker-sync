@@ -29,7 +29,7 @@ Rekordbox Library  →  Editor Library  →  Device Library
 - Import checked playlists into a local Editor library
 - Sync Editor cases to a connected Pacemaker, copying audio files and writing device-local paths, with warnings before anything is removed, overwritten or won't fit
 - Backs up the Pacemaker's database to your computer before changing it
-- Drag and drop audio files/folders from Explorer/Finder straight into the library, optionally directly into a case
+- Drag and drop audio files/folders from Explorer/Finder straight into the library, onto a case, or onto empty space in Editor Library to make a new case
 - Create cases by hand, drag tracks onto a case to add them, drag within an open case to reorder, remove tracks from a case without deleting them from the library
 - Rename, delete, and browse cases in both the Editor and Device libraries
 - Waveform previews and click-to-preview playback for tracks
@@ -42,7 +42,7 @@ Rekordbox Library  →  Editor Library  →  Device Library
 
 - Windows or macOS (see the macOS note below)
 - Python 3.9 or newer, if running from source
-- Rekordbox 6+ (for the encrypted `master.db` that this app reads)
+- Rekordbox 6+, only for importing Rekordbox playlists. Without it, drag music in from Explorer/Finder or import M3U8 playlists. Waveform previews also need Rekordbox.
 - A Tonium Pacemaker connected as a removable drive, for pushing to a device
 
 ## Setup
