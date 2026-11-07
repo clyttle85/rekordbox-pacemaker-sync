@@ -21,7 +21,7 @@ def _selftest(app: QApplication) -> int:
     # library, so the "not found" warning is expected here.
     for name in ("information", "warning", "critical"):
         setattr(QMessageBox, name, staticmethod(lambda _parent, title, text, *_a, **_k: print(
-            f"[selftest] {title}: {text}", flush=True
+            f"[selftest] {title}: {text!a}", flush=True   # !a: Windows consoles aren't UTF-8
         )))
 
     try:
