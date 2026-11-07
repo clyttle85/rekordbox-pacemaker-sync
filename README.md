@@ -2,9 +2,17 @@
 
 A PyQt6 desktop app for syncing playlists from **Rekordbox** to the **Tonium Pacemaker** hardware DJ device.
 
-## Download for Mac
+## Download
 
-Get the `.dmg` for your Mac from the [Releases page](https://github.com/clyttle85/rekordbox-pacemaker-sync/releases/latest), then follow the step-by-step **[Mac install guide](INSTALL_MAC.md)**. It needs macOS 14.4 or newer, and no technical knowledge.
+Everything is free, and you don't need a GitHub account.
+
+1. **Get the installer** from the [Releases page](https://github.com/clyttle85/rekordbox-pacemaker-sync/releases/latest), under **Assets**:
+   - Mac with Apple Silicon (M1, M2, M3 or later): `-arm64.dmg`
+   - Intel Mac: `-intel.dmg`
+   - Windows: `-windows-setup.exe`
+2. **Mac users: get the [beginner's guide (PDF)](https://github.com/clyttle85/rekordbox-pacemaker-sync/raw/main/Rekordbox_Pacemaker_Sync_Mac_Guide.pdf).** It covers installing and using the app, step by step, and needs no technical knowledge. There's also a shorter [install guide](INSTALL_MAC.md) to read online.
+
+The Mac app needs macOS 14.4 or newer. It isn't signed by Apple yet, so macOS asks you to approve it the first time: the guides show how. It hasn't been tried on a real Mac with a real Pacemaker yet, so back up anything on your Pacemaker that you can't replace first.
 
 ## What it does
 

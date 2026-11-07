@@ -391,6 +391,8 @@ Database paths are auto-detected on startup and the device is polled every 2 sec
 
 ## Building
 
+A release ships all three installers from the same commit, with the same version number. Set the version in `installer.iss`, tag `vX.Y.Z` on `main` (CI builds the DMGs and creates the Release), build the Windows installer from that commit, then attach it and the PDF guide to the Release.
+
 - **Windows:** see `BUILD_INSTALLER.md`. Built locally with PyInstaller + Inno Setup.
 - **macOS:** `.github/workflows/build-mac.yml` builds an arm64 and an Intel DMG on GitHub Actions, on manual dispatch or a `v*` tag (tags also publish a GitHub Release). PyInstaller can't cross-compile, so CI is the only way to build for Mac from Windows. Each build runs the smoke tests. Signing and notarization steps run only once the `APPLE_*` repo secrets are set. See `BUILD_INSTALLER_MAC.md`.
 - A new module imported only dynamically must be added to the Mac spec's `hiddenimports`. The smoke tests are what catch a miss.
