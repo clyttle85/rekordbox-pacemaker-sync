@@ -36,7 +36,7 @@ try:
 except ImportError:
     _PREVIEW_OK = False
 
-from core.rekordbox_reader import RekordboxReader, PlaylistNode, TrackInfo
+from core.rekordbox_reader import RekordboxError, RekordboxReader, PlaylistNode, TrackInfo
 from core import logger as _logger
 from ui.style import ACCENT
 
@@ -1401,11 +1401,13 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage("Rekordbox library loaded.")
         except Exception as e:
             _logger.log.error("Could not load Rekordbox: %s", e, exc_info=True)
-            self.statusBar().showMessage(f"Could not load Rekordbox: {e}")
+            title = e.title if isinstance(e, RekordboxError) else "Couldn't Read Rekordbox Library"
+            self.statusBar().showMessage(title)
             QMessageBox.warning(
-                self, "Rekordbox Not Found",
-                f"Could not connect to the Rekordbox database:\n\n{e}\n\n"
-                "You can still use File → Import from M3U8."
+                self, title,
+                f"{e}\n\n"
+                "You can still add music with File → Import from M3U8, or by "
+                "dragging audio files into the library."
             )
 
     def _refresh_tree(self):

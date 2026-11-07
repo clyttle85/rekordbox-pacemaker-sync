@@ -37,9 +37,6 @@ Rekordbox Library  →  Editor Library  →  Device Library
 # Install dependencies
 pip install -r requirements.txt
 
-# One-time: let pyrekordbox find/derive the decryption key for your Rekordbox master.db
-python -m pyrekordbox setup
-
 # Run
 python main.py
 ```
