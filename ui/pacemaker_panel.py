@@ -180,6 +180,9 @@ class PacemakerLibraryPanel(QWidget):
         self._db_path: str = ""
         self._current_tracks: list = []   # TrackInfo list for the selected case
         self._device_total_bytes: int = 0   # reported by set_storage_info()
+        self._case_track_sizes: dict = {}   # {case_id: {location: size}}, for the selected size
+        self._tracks_on_device: set = set()
+        self._device_connected = False
         self._case_icon = _make_case_icon()
         # Inline rename state
         self._editing_item = None
@@ -310,15 +313,6 @@ class PacemakerLibraryPanel(QWidget):
             self._track_table = None
             self._all_tracks_table = None
             layout.addWidget(self._list, stretch=1)
-
-        # Legend
-        legend_row = QHBoxLayout()
-        dot = QLabel("●")
-        dot.setStyleSheet("color: #4caf50;")
-        legend_row.addWidget(dot)
-        legend_row.addWidget(QLabel("Managed by this app"))
-        legend_row.addStretch()
-        layout.addLayout(legend_row)
 
         # Buttons
         btn_row = QHBoxLayout()
@@ -460,6 +454,21 @@ class PacemakerLibraryPanel(QWidget):
         """The Push to Device button (only valid when show_push_button=True)."""
         return self._push_btn
 
+    def set_eject_enabled(self, enabled: bool) -> None:
+        if self._show_eject:
+            self._eject_btn.setEnabled(enabled)
+
+    def case_by_id(self, case_id: "int | None") -> "dict | None":
+        return next((c for c in self._cases if c["case_id"] == case_id), None)
+
+    def set_track_sizes(self, case_track_sizes: dict, on_device: set, device_connected: bool) -> None:
+        """What the "selected" size label needs: each case's tracks, and which are on the device."""
+        self._case_track_sizes = case_track_sizes
+        self._tracks_on_device = on_device
+        self._device_connected = device_connected
+        if self._show_selection_size:
+            self._update_selection_size()
+
     def set_storage_info(self, used_bytes: int, total_bytes: int) -> None:
         """Update the storage bar in the device panel."""
         if not self._show_storage:
@@ -493,6 +502,7 @@ class PacemakerLibraryPanel(QWidget):
         cases            — list of {"case_id": int, "name": str, "track_count": int}
         managed_case_ids — case IDs tracked in sync state (shown in green)
         """
+        selected_ids = {c["case_id"] for c in self.selected_cases()}
         self._cases = cases
         self._managed_case_ids = managed_case_ids
         self._list.blockSignals(True)
@@ -512,6 +522,8 @@ class PacemakerLibraryPanel(QWidget):
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
                 item.setCheckState(Qt.CheckState.Unchecked)
             self._list.addItem(item)
+            if case["case_id"] in selected_ids:
+                item.setSelected(True)   # a reload shouldn't lose the user's place
 
         self._list.blockSignals(False)
 
@@ -520,8 +532,7 @@ class PacemakerLibraryPanel(QWidget):
         self._count_label.setText(f"{count} case{'s' if count != 1 else ''} {where}.")
         if self._show_tabs:
             self._tab_widget.setTabText(0, f"Cases ({count})")
-        self._delete_btn.setEnabled(False)
-        self._delete_btn.setText("Delete")
+        self._update_action_buttons()
 
     def clear(self) -> None:
         self._cases = []
@@ -540,6 +551,10 @@ class PacemakerLibraryPanel(QWidget):
         if self._track_table:
             self._track_table.setRowCount(0)
             self._current_tracks = []
+        if self._show_tabs:
+            self._tab_widget.setTabText(0, "Cases")
+            self.load_all_device_tracks([])
+            self.set_track_cases_banner([])
 
     def load_tracks(self, tracks: list) -> None:
         """
@@ -678,25 +693,29 @@ class PacemakerLibraryPanel(QWidget):
             self._finish_inline_edit("", committed=False)
 
     def _update_selection_size(self) -> None:
+        """The ticked cases' size, counting a track in several cases once and skipping any already copied."""
         checked = self.get_checked_cases()
-        total = sum(c.get("file_size_bytes", 0) for c in checked)
-        if checked and total > 0:
-            self._sel_size_lbl.setText(
-                f"{len(checked)} case{'s' if len(checked) != 1 else ''} selected  —  {_fmt_bytes(total)}"
-            )
-        elif checked:
-            self._sel_size_lbl.setText(
-                f"{len(checked)} case{'s' if len(checked) != 1 else ''} selected"
-            )
-        else:
+        if not checked:
             self._sel_size_lbl.setText("")
+            return
+        tracks: dict = {}
+        for case in checked:
+            tracks.update(self._case_track_sizes.get(case["case_id"], {}))
+        total = sum(size for location, size in tracks.items() if location not in self._tracks_on_device)
+        text = f"{len(checked)} case{'s' if len(checked) != 1 else ''} selected"
+        if total > 0:
+            text += f"  —  {_fmt_bytes(total)}" + (" to copy" if self._device_connected else "")
+        self._sel_size_lbl.setText(text)
 
-    def _on_selection_changed(self):
+    def _update_action_buttons(self) -> None:
         count = len(self._list.selectedItems())
         self._delete_btn.setEnabled(count > 0)
         self._delete_btn.setText(f"Delete ({count})" if count > 1 else "Delete")
         if self._show_rename:
             self._rename_btn.setEnabled(count >= 1)
+
+    def _on_selection_changed(self):
+        self._update_action_buttons()
         # Notify listeners so they can fetch + load tracks for this case
         case = self.selected_case()
         self.case_selected.emit(case["case_id"] if case else -1)

@@ -16,9 +16,11 @@ Device DB:  <device root>/.Pacemaker/music.db  (hidden folder on the device)
 from __future__ import annotations
 
 import os
+import re
 import string
 import sys
 
+from core.audio_formats import ALL_AUDIO_EXTENSIONS, extension
 from core.db_schema import create_empty_editor_db
 
 _IS_MAC = sys.platform == "darwin"
@@ -34,6 +36,11 @@ def default_editor_db_path() -> str:
         )
     appdata = os.environ.get("APPDATA", "")
     return os.path.join(appdata, "Tonium", "Pacemaker", "music.db")
+
+
+def device_backup_dir() -> str:
+    """Where backups of Pacemaker databases go: on the computer, beside the Editor DB."""
+    return os.path.join(os.path.dirname(default_editor_db_path()), "PacemakerBackups")
 
 
 def find_editor_db() -> str:
@@ -105,6 +112,26 @@ def device_root(device_db_path: str) -> str:
 def device_music_root(device_db_path: str) -> str:
     """<device root>/.Pacemaker/music.db -> <device root>/.Pacemaker/Music."""
     return os.path.join(device_root(device_db_path), ".Pacemaker", "Music")
+
+
+def find_orphaned_device_files(music_root: str, db_locations) -> list[str]:
+    """
+    Audio files under music_root that no database location refers to, plus .part files
+    left by an interrupted copy.
+
+    Files are matched by name alone, ignoring upper/lower case. Every device file name is
+    unique, and this keeps files that older-format locations (full paths, different drive
+    letters, different case) still refer to. When unsure, a file is kept.
+    """
+    referenced = {re.split(r"[\\/]", loc or "")[-1].casefold() for loc in db_locations}
+    orphans: list[str] = []
+    for dirpath, _dirs, files in os.walk(music_root):
+        for name in files:
+            if name.endswith(".part") or (
+                extension(name) in ALL_AUDIO_EXTENSIONS and name.casefold() not in referenced
+            ):
+                orphans.append(os.path.join(dirpath, name))
+    return orphans
 
 
 def is_on_device(path: str, device_db_path: str) -> bool:

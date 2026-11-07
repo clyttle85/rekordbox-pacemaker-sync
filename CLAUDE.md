@@ -4,6 +4,12 @@ This file gives any AI assistant (Claude, Gemini, Cursor, ChatGPT, etc.) full co
 
 ---
 
+## Windows and Mac must stay in sync
+
+Every fix and feature applies to both the Windows and Mac versions of the app, and the two are kept in sync at all times. Put changes in the shared code. If something has to differ by operating system, implement and check both sides in the same change, and never ship a fix for one platform only.
+
+---
+
 ## What This Project Is
 
 A cross-platform (Windows and macOS) PyQt6 desktop GUI application that syncs playlists from **Rekordbox** (DJ software) to the **Tonium Pacemaker** (a hardware DJ device). The user sees their Rekordbox playlists as a checkbox tree — checking a playlist and clicking Sync adds it to the Editor Library. Cases can then be pushed to the physical device, with the app copying the audio files.
@@ -29,6 +35,7 @@ rekordbox-pacemaker-sync/
 ├── main.py                    # Entry point — creates QApplication, launches MainWindow; hidden --selftest flag
 ├── requirements.txt
 ├── CLAUDE.md                  # This file
+├── AGENTS.md                  # Rules for AI coding agents, including Windows/Mac parity
 ├── INSTALL_MAC.md             # End-user Mac install guide
 ├── BUILD_INSTALLER.md         # Windows build (PyInstaller + Inno Setup)
 ├── BUILD_INSTALLER_MAC.md     # Mac build (CI), signing and notarization setup
@@ -45,12 +52,15 @@ rekordbox-pacemaker-sync/
 │   ├── rekordbox_reader.py    # Reads Rekordbox master.db via pyrekordbox; RekordboxError types
 │   ├── pacemaker_writer.py    # Reads/writes Pacemaker music.db (plain SQLite)
 │   ├── sync_state.py          # Persists sync state as JSON alongside music.db
+│   ├── sync_map.py            # The device's record of synced cases, and which library owns it
+│   ├── device_backup.py       # Backs up a device music.db to the computer before changes
+│   ├── audio_formats.py       # The list of importable formats, used by every import route
 │   ├── device_finder.py       # Per-OS Editor/Device paths, device_root()/device_music_root()
 │   ├── db_schema.py           # Creates a fresh Editor music.db if none exists
-│   ├── file_import.py         # Drag-and-drop audio file/folder import
+│   ├── file_import.py         # Expands dropped audio files/folders
 │   ├── logger.py              # Optional debug file logging
 │   ├── selftest.py            # Checks behind main.py --selftest
-│   └── m3u8_reader.py         # Parses M3U8 files + reads audio metadata via Mutagen
+│   └── m3u8_reader.py         # Parses M3U8 files; checks audio files and reads their tags
 └── ui/
     ├── main_window.py         # Main window — see detailed breakdown below
     ├── playlist_tree.py       # Left panel: Rekordbox playlist tree with checkboxes
@@ -85,7 +95,7 @@ Five-column horizontal layout with narrow connector strips between panels:
 - **Connector strip 2**: "Push (N) to / Device →" button — copies checked cases + their audio files to device.
 - **Device Library**: Cases on the connected Pacemaker. Browse button for manual path. Eject button. Multi-select delete.
 
-File menu: **Import from M3U8…** | **Repair Device Database…** | **Clean Up Device Files…** | Exit
+File menu: **Reload Rekordbox Library** | **Import from M3U8…** | **Repair Device Database…** | **Clean Up Device Files…** | Exit. The first four are disabled during a sync.
 
 Debug menu (top level, not under File): **Enable Debug Logging** | **Open Log File…**. The log, `rb_pm_sync.log`, sits next to the Editor `music.db`.
 
@@ -139,7 +149,7 @@ Key tables:
 **`casetracks`** — junction table:
 - `case_id`, `track_id` — insertion order (rowid) preserves track order within a case
 
-Track deduplication is by `location` (file path). Tracks shared across cases are only deleted when they have zero casetracks references.
+Track deduplication is by `location` (file path). `insert_or_get_track` brings an existing track's details up to date in place, never blanking a value, so its `track_id` and case memberships survive. Tracks shared across cases are only deleted when they have zero casetracks references. A case can hold a track twice, but only if the user chose Add at the duplicates prompt.
 
 ---
 
@@ -159,11 +169,23 @@ Track deduplication is by `location` (file path). Tracks shared across cases are
 
 `HHHHHHHH` is the CRC32 of the source file's full path, and `X`/`Y` are its first two hex characters. Because the source path differs between computers, the same file pushed from two machines is copied twice.
 
-**Ticks mean "should be on the device"**, and `rb_sync_map.json` on the device maps Editor case IDs to device case IDs. `_confirm_and_sync_to_device` compares the ticks and the actual device contents, then makes three lists: add, remove, and update (a ticked case whose name or ordered tracks differ). It asks for confirmation before any remove or update, but not for adds alone.
+**Ticks mean "should be on the device"**, and `rb_sync_map.json` on the device maps Editor case IDs to device case IDs, and names the Editor library that wrote it (`core/sync_map.py`). The library ID is a random number in the Editor DB's SQLite `application_id`, so it adds no tables, and a recreated DB gets a new one. Only the user changes ticks, except that connecting a device adds the cases on it, and Delete in the DEVICE panel clears that case's tick.
+
+`_confirm_and_sync_to_device` compares the ticks and the actual device contents, then makes three lists: add, remove, and update (a ticked case whose name, ordered tracks or track details differ). The checks run in this order:
+
+1. **Synced to another library:** the record names a different library, so its case IDs mean nothing here. Two separate confirmations are required (`_confirm_replace_device`), then everything on the device is erased and replaced with the ticked cases. With nothing ticked, it refuses.
+2. **File name collisions:** warns, and on Continue leaves the second file off rather than overwrite the first.
+3. **Space:** warns if the sync won't fit, allowing for what it frees.
+4. **Confirmation** of any remove or update, but not adds alone.
+5. **Backup** of the device DB to `<Editor DB folder>/PacemakerBackups`, keeping the last 10. On the computer, because they use no device space and survive the device failing.
+
+A damaged record is set aside as `.corrupt` and rebuilt by matching case names. A legacy record with no owner is adopted by the first library to sync.
+
+**During a sync** the record is saved after every change, new cases being recorded before their tracks are copied, so an interrupted sync finishes on the next Sync rather than adding duplicates. Cancel Sync, or Quit (which warns first), stops after the current track. Copies go to a `.part` file first. A full device ends the sync. Other copy failures are reported by name, and a new case with nothing copied is removed. If the device vanishes, the app shows "Device Removed During Sync", and `_poll_for_device` notices at other times.
 
 **Push process** (`DeviceSyncWorker`):
 1. For each checked Editor case, reads tracks via `get_case_tracks_as_trackinfo()`
-2. `_copy_track` copies each file to the path above (skipped if it exists with the same size) and creates the `.str` file
+2. `_copy_track` copies each file to the path above (skipped if that version is already there) and creates the `.str` file
 3. Uses `dataclasses.replace(track, location=pmdb_location)` to create the device TrackInfo
 4. Calls `device.insert_or_get_track(device_track)` with that location
 5. Links track to case via `casetracks`
@@ -190,36 +212,21 @@ Cases can be renamed manually in the Editor Library panel (double-click or Renam
 
 ---
 
-## Sync Logic (Current — Append-Only)
+## Importing
 
-1. User checks playlists → `_recompute_queue()` generates ADD items only (no remove/update)
-2. User clicks "Sync to Editor Library" → confirmation dialog
-3. `SyncWorker` (QThread) runs `writer.add_playlist(name, tracks)` for each
-4. On success: **tree unchecks all** (`_tree.uncheck_all()`), Editor Library refreshes
-5. No sync state is recorded — the queue always starts empty next session
+**Formats:** `core/audio_formats.py` is the one list. MP3, FLAC, M4A, MP4, AAC, WAV and AIFF are imported. `.aif`, `.ogg`, `.opus` and `.wma` are left out of every import route and the user is told. The device tools still handle them, since older versions could put them on a device.
 
-**Deleting cases** is a manual action via the Delete button in either library panel. Multi-select supported (Ctrl/Shift+Click). Single confirmation dialog lists all names.
+**File checks:** drag-and-drop and M3U8 imports check every file first (`read_track_metadata` raises `AudioFileError` for empty, damaged, audio-less or mislabelled files). Any problem stops the whole import and names the files. Rekordbox imports aren't checked, because Rekordbox has already read those files, and their drives may be disconnected.
 
----
+**Duplicates:** adding a track to a case it's already in, by any route, shows `DUPLICATES_PROMPT` with Add and Skip.
 
-## Sync State
+**Rekordbox → Editor** (`_confirm_and_sync`): checked playlists are read, confirmed, and added as new cases by `SyncWorker`. The tree then unchecks. Importing again makes a second case, suffixed `_2`, and refreshes details of existing tracks. A track whose file has moved or been renamed has a new location, so it counts as a new track. File → Reload Rekordbox Library picks up new playlists and keeps ticks.
 
-Still stored as `rb_pacemaker_sync_state.json` alongside `music.db`, but now only used for:
-- Determining whether a deleted Editor case should have its sync state entry cleaned up
-- The green dot indicator (managed cases) in the Editor Library panel
+**Deleting cases** is a manual action via the Delete button in either library panel. Multi-select supported. Single confirmation dialog lists all names. Device deletes back up the DB first. Unassigned tracks can be removed from the library with the delete key in All Tracks.
 
-The tree no longer pre-checks previously synced playlists. `_refresh_tree()` passes `set()` for `synced_ids`.
+## Quitting
 
-```json
-{
-  "12345": {
-    "pacemaker_case_id": 7,
-    "playlist_name": "My Playlist",
-    "last_synced": "2026-03-26T15:00:00",
-    "track_locations": ["/path/to/track1.mp3"]
-  }
-}
-```
+`closeEvent` warns on the first Quit during a sync, import or clean-up. Stop and Quit ends the work safely, then quits. `_WorkProgressDialog` forwards close events to the main window, because on macOS Cmd+Q closes every window and would otherwise cancel the progress dialog silently. `_shut_down` waits for every thread, since destroying a running QThread aborts the app. `main.py` installs a `sys.excepthook` so an unexpected error in a slot shows a message instead of ending the app. `--selftest` leaves it out so errors still fail CI.
 
 ---
 
@@ -235,18 +242,18 @@ The tree no longer pre-checks previously synced playlists. `_refresh_tree()` pas
 - Signals: `progress(int, int, str)`, `finished(bool, str)`
 - `__init__(editor_db, device_db, cases)`: `cases` is list of `{"case_id", "name", "track_count", ...}`
 - `expected_locations(tracks, device_db)`: what a case should hold on the device. Tracks whose source is missing stay if their copy is already there, so an unplugged music drive doesn't strip them
-- `_copy_track(src_path, device_db) -> (local_dest, pmdb_location)` (static): copies file, skips if same size exists, creates the `.str` companion
-- `run()`: copies files, writes device-path tracks to device DB, per-track progress
+- `_copy_track(src_path, device_db) -> (local_dest, pmdb_location)`: copies the file via a `.part` name, skipping one already there (same size and not older, see `_needs_copy`), and creates the `.str` companion
+- `run()`: copies files, writes device-path tracks to device DB, per-track progress. `cancel()` stops after the current track. Afterwards, `failures`, `missing`, `was_cancelled` and `device_lost` say what happened
 
 **`RepairDeviceDbDialog(QDialog)`** — File → Repair Device Database…
 - Scans device DB for tracks with non-existent `location` paths
 - Walks a chosen folder for audio files, builds `{lowercase_filename: full_path}` index
 - Matches broken tracks by filename, shows count of fixable vs unmatched
-- Applies fixes via `UPDATE tracks SET location = ? WHERE track_id = ?`
+- Applies fixes via `UPDATE tracks SET location = ? WHERE track_id = ?`, after backing up the DB. Only files inside `.Pacemaker/Music` can be used, so a computer path never reaches the device DB
 - Auto-populates device DB path and `<device root>/.Pacemaker/Music` scan folder if device panel has a path
 
 **`M3U8ImportDialog(QDialog)`** — File → Import from M3U8…
-- Reads M3U8 file, reads audio metadata via Mutagen, imports as a new case
+- Reads M3U8 file in any common encoding, resolving relative paths against the playlist's folder, and imports it as a new case
 
 **`MainWindow(QMainWindow)`**
 - `_build_ui()`: 5-column layout — `left_splitter` | connector(sync_btn) | `_editor_panel` | connector(push_btn) | `_device_panel`
@@ -257,6 +264,7 @@ The tree no longer pre-checks previously synced playlists. `_refresh_tree()` pas
 - `_run_push()`: sets `QProgressDialog` max to `sum(c["track_count"] for c in cases)`
 - `_on_rename_editor_case(cases)`: sequential `QInputDialog` loop; Cancel stops sequence
 - `_delete_cases()`: single confirmation dialog, loops through deletions
+- `_connect_device(path)`: the one route for a device being found or chosen. `_disconnect_device_ui()` is the reverse, for Eject, unplugging or loss during a sync
 - `_eject_device()`: Windows uses `DeviceIoControl` lock/dismount/eject (`_do_eject_windows`), macOS uses `diskutil eject` (`_do_eject_mac`)
 - `_build_playlist_path_map()`: `{playlist_id: [folder, ..., name]}`
 - `_shorten_segment(segment, max_chars)`: strips `NN - ` prefix, truncates
@@ -305,7 +313,8 @@ Signals:
 - `db_path_changed = pyqtSignal(str)`
 
 Key methods:
-- `load_cases(cases, managed_case_ids)`: populates list; managed IDs shown in green `#4caf50`
+- `load_cases(cases, managed_case_ids)`: populates the list, keeping the selection. `managed_case_ids` is always empty at the moment
+- `set_track_sizes(sizes, on_device, connected)`: feeds the "selected" label, which counts a shared track once and skips tracks already on the device
 - `get_checked_cases()`: returns cases whose checkbox is ticked
 - `selected_cases()`: returns highlighted (selected) cases
 - `_update_push_button()`: updates push button text to `"Push (N) to\nDevice →"`
@@ -331,7 +340,8 @@ Key methods:
 - `delete_case(case_id)` — deletes case + casetracks, NOT tracks
 - `get_case_track_locations(case_id) -> set[str]`
 - `clear_case_tracks(case_id)`
-- `insert_or_get_track(track: TrackInfo) -> int` — dedup by `location`
+- `insert_or_get_track(track: TrackInfo, date_source=None) -> int` — dedup by `location`, refreshing details of an existing track
+- `library_id() -> int` — this DB's random ID, in the SQLite header
 - `link_track_to_case(case_id, track_id)`
 - `delete_orphan_tracks(locations)` — only deletes if no remaining casetracks refs
 - `sync_playlist(case_id, tracks, cb) -> list[str]` — replace case contents
@@ -421,7 +431,6 @@ All core features are implemented and working:
 
 ## Known Minor Gaps / Future Work
 
-- `disc_number` / `number_of_discs` in `m3u8_reader.py` both read from `TPOS` — should split on `/` (low priority)
 - No batch transactions in `pacemaker_writer.py` — each track insert commits individually (fine for typical sizes)
 - No test suite beyond `--selftest` and the CI smoke tests
 - UI modernisation (dark theme, flat buttons, panel headers) — discussed but not yet implemented

@@ -327,7 +327,9 @@ class RekordboxReader:
             bit_rate = 0
             if content.BitRate is not None:
                 try:
-                    bit_rate = int(content.BitRate) // 1000
+                    # Rekordbox stores kbps. Anything this large must be bits per second.
+                    raw_rate = int(content.BitRate)
+                    bit_rate = raw_rate // 1000 if raw_rate >= 10000 else raw_rate
                 except (ValueError, TypeError):
                     bit_rate = 0
 
@@ -345,9 +347,7 @@ class RekordboxReader:
                 except (ValueError, TypeError):
                     file_size = 0
 
-            # Derive format from file extension
-            ext = os.path.splitext(content.FolderPath)[1].upper().lstrip(".")
-            fmt = ext if ext in ("MP3", "FLAC", "MP4", "M4A", "AAC", "WAV", "AIFF") else "MP3"
+            fmt = os.path.splitext(content.FolderPath)[1].upper().lstrip(".")
 
             tracks.append(TrackInfo(
                 location=content.FolderPath,

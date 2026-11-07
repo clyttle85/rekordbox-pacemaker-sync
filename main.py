@@ -37,6 +37,28 @@ def _selftest(app: QApplication) -> int:
     return code
 
 
+def _install_crash_handler() -> None:
+    """
+    PyQt6 ends the app on any error it can't hand to a Python caller. Show it instead, so an
+    unexpected problem doesn't lose the user's session. --selftest doesn't use this, so that
+    errors still fail the CI smoke test.
+    """
+    import traceback
+    from core.logger import log
+
+    def handle(exc_type, exc, tb):
+        details = "".join(traceback.format_exception(exc_type, exc, tb))
+        print(details, file=sys.stderr, flush=True)
+        log.error("Unexpected error:\n%s", details)
+        QMessageBox.critical(
+            None, "Something Went Wrong",
+            f"An unexpected problem occurred, but the app is still running.\n\n{exc}\n\n"
+            "If it keeps happening, turn on Debug → Enable Debug Logging and report the log file."
+        )
+
+    sys.excepthook = handle
+
+
 def main():
     app = QApplication(sys.argv)
     app.setApplicationName("Rekordbox → Pacemaker Sync")
@@ -46,6 +68,7 @@ def main():
     app.setStyleSheet(DARK_STYLESHEET)
     if SELFTEST_FLAG in sys.argv:
         sys.exit(_selftest(app))
+    _install_crash_handler()
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
