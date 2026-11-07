@@ -56,6 +56,25 @@ class PacemakerWriter:
         cursor.execute("UPDATE cases SET name = ? WHERE case_id = ?", (new_name, case_id))
         self._conn.commit()
 
+    def case_name_exists(self, name: str, ignore_case_id: Optional[int] = None) -> bool:
+        """True if another case already has this name, ignoring upper/lower case."""
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT case_id, name FROM cases")
+        wanted = name.casefold()
+        return any(
+            (row["name"] or "").casefold() == wanted and row["case_id"] != ignore_case_id
+            for row in cursor.fetchall()
+        )
+
+    def unique_case_name(self, name: str) -> str:
+        """Return name, or name_2, name_3… if a case already has that name."""
+        candidate = name
+        suffix = 2
+        while self.case_name_exists(candidate):
+            candidate = f"{name}_{suffix}"
+            suffix += 1
+        return candidate
+
     def delete_case(self, case_id: int) -> None:
         """Delete a case and its casetracks entries. Does NOT delete tracks."""
         cursor = self._conn.cursor()
@@ -72,6 +91,17 @@ class PacemakerWriter:
             WHERE ct.case_id = ?
         """, (case_id,))
         return {row["location"] for row in cursor.fetchall()}
+
+    def get_ordered_case_track_locations(self, case_id: int) -> list[str]:
+        """Return a case's track locations in running order, including any repeats."""
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT t.location FROM tracks t
+            JOIN casetracks ct ON ct.track_id = t.track_id
+            WHERE ct.case_id = ?
+            ORDER BY ct.rowid
+        """, (case_id,))
+        return [row["location"] for row in cursor.fetchall()]
 
     def clear_case_tracks(self, case_id: int) -> None:
         """Remove all casetracks entries for a case (leaves tracks table intact)."""

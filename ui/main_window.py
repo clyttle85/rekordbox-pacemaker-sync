@@ -42,6 +42,11 @@ from ui.style import ACCENT
 
 _WAVE_COL_ROLE = Qt.ItemDataRole.UserRole + 3   # stores list[tuple[int,int]] waveform data
 
+# The main delete key on a Mac keyboard is Key_Backspace to Qt. Key_Delete is fn+delete.
+_REMOVE_TRACK_KEYS = (
+    (Qt.Key.Key_Delete, Qt.Key.Key_Backspace) if sys.platform == "darwin" else (Qt.Key.Key_Delete,)
+)
+
 _ROW_HOVER_TINT = QColor(ACCENT)
 _ROW_HOVER_TINT.setAlpha(90)
 
@@ -312,7 +317,7 @@ class _CentralTrackTable(QTableWidget):
             self.reorder_requested.emit(new_order)
 
     def keyPressEvent(self, event) -> None:
-        if self._case_mode and event.key() == Qt.Key.Key_Delete:
+        if self._case_mode and event.key() in _REMOVE_TRACK_KEYS:
             locations = self._selected_locations()
             if locations:
                 self.remove_from_case_requested.emit(locations)
@@ -496,27 +501,61 @@ class DeviceSyncWorker(QObject):
     finished = pyqtSignal(bool, str)
 
     def __init__(self, editor_db: str, device_db: str,
-                 to_add: list, to_remove: list, sync_map: dict):
+                 to_add: list, to_remove: list, to_update: list, sync_map: dict):
         super().__init__()
         self._editor_db = editor_db
         self._device_db = device_db
         self._to_add = to_add        # [{"case_id", "name", "track_count"}]
         self._to_remove = to_remove  # [{"editor_case_id", "device_case_id", "name"}]
+        self._to_update = to_update  # [{"case_id", "device_case_id", "name", "track_count"}]
         self._sync_map = dict(sync_map)  # working copy; written to device on completion
 
     @staticmethod
-    def _delete_device_files(locations: list[str], device_db: str) -> None:
+    def _local_path(location: str, device_db: str) -> str:
         """
-        Delete audio files (and their .str companions) for the given pmdb locations.
+        Where a device DB location lives on disk.
         /pmdb_tracks/a/b/xxxxxxxx.mp3  ->  <device root>/.Pacemaker/Music/a/b/xxxxxxxx.mp3
         """
-        music_root = device_music_root(device_db)
+        if location.startswith("/pmdb_tracks/"):
+            rel = location[len("/pmdb_tracks/"):].replace("/", os.sep)
+            return os.path.join(device_music_root(device_db), rel)
+        return location  # old-format path stored as a local path
+
+    @classmethod
+    def expected_locations(cls, tracks: list, device_db: str) -> list[str]:
+        """
+        The device locations a case should hold, in order. A track whose source file
+        can't be found stays if its copy is already on the device, so disconnecting a
+        music drive doesn't make a sync strip those tracks from the case.
+        """
+        locations = []
+        for track in tracks:
+            location = cls._pmdb_location(track.location)
+            if os.path.exists(track.location) or os.path.exists(cls._local_path(location, device_db)):
+                locations.append(location)
+        return locations
+
+    def _push_track(self, track, device: PacemakerWriter) -> "int | None":
+        """Put one track on the device. Returns its device track_id, or None if skipped."""
+        from core.logger import log as _log
+        location = self._pmdb_location(track.location)
+        if os.path.exists(track.location):
+            try:
+                self._copy_track(track.location, self._device_db)
+                _log.debug("  Copied: %s -> %s", track.location, location)
+            except Exception as copy_error:
+                _log.error("  Copy failed for %s: %s", track.location, copy_error, exc_info=True)
+                return None
+        elif not os.path.exists(self._local_path(location, self._device_db)):
+            _log.warning("  Track file not found, skipping: %s", track.location)
+            return None
+        return device.insert_or_get_track(dataclasses.replace(track, location=location))
+
+    @staticmethod
+    def _delete_device_files(locations: list[str], device_db: str) -> None:
+        """Delete audio files (and their .str companions) for the given pmdb locations."""
         for loc in locations:
-            if loc.startswith("/pmdb_tracks/"):
-                rel = loc[len("/pmdb_tracks/"):].replace("/", os.sep)
-                local_path = os.path.join(music_root, rel)
-            else:
-                local_path = loc  # old-format path stored as a local path
+            local_path = DeviceSyncWorker._local_path(loc, device_db)
             try:
                 if os.path.exists(local_path):
                     os.remove(local_path)
@@ -596,57 +635,69 @@ class DeviceSyncWorker(QObject):
                 _log.info("Device sync: deleting %d file(s) from device storage", len(deleted_locs))
                 self._delete_device_files(deleted_locs, self._device_db)
 
-            # ── Phase 2: Push new checked cases to device ─────────────────
-            total_tracks = sum(c.get("track_count", 0) for c in self._to_add)
+            # ── Phases 2 and 3: Update changed cases, push new ones ───────
+            total_tracks = sum(c.get("track_count", 0) for c in self._to_add + self._to_update)
+            pushed_to_new_cases = 0
 
-            if self._to_add:
-                _log.info("Device sync: pushing %d case(s), %d tracks", len(self._to_add), total_tracks)
+            if self._to_add or self._to_update:
+                _log.info(
+                    "Device sync: %d case(s) to update, %d to add, %d tracks",
+                    len(self._to_update), len(self._to_add), total_tracks,
+                )
                 with PacemakerWriter(self._editor_db) as editor:
                     all_tracks = {
                         c["case_id"]: editor.get_case_tracks_as_trackinfo(c["case_id"])
-                        for c in self._to_add
+                        for c in self._to_add + self._to_update
                     }
 
                 with PacemakerWriter(self._device_db) as device:
-                    for case in self._to_add:
-                        tracks = all_tracks[case["case_id"]]
-                        device_case_id = device.create_case(case["name"])
-                        self._sync_map[str(case["case_id"])] = device_case_id
-
-                        for track in tracks:
+                    def push_tracks(case: dict) -> list[int]:
+                        nonlocal done, skipped
+                        track_ids = []
+                        for track in all_tracks[case["case_id"]]:
                             self.progress.emit(
                                 done, max(total_tracks, 1),
                                 f"Copying: {os.path.basename(track.location)}"
                             )
-                            if not os.path.exists(track.location):
-                                _log.warning("  Track file not found, skipping: %s", track.location)
+                            track_id = self._push_track(track, device)
+                            if track_id is None:
                                 skipped += 1
-                                done += 1
-                                continue
-                            try:
-                                _win_dest, pmdb_loc = self._copy_track(
-                                    track.location, self._device_db
-                                )
-                                _log.debug("  Copied: %s -> %s", track.location, pmdb_loc)
-                            except Exception as _copy_err:
-                                _log.error("  Copy failed for %s: %s", track.location, _copy_err, exc_info=True)
-                                skipped += 1
-                                done += 1
-                                continue
-                            device_track = dataclasses.replace(track, location=pmdb_loc)
-                            tid = device.insert_or_get_track(device_track)
-                            device.link_track_to_case(device_case_id, tid)
+                            else:
+                                track_ids.append(track_id)
                             done += 1
+                        return track_ids
 
-            # ── Phase 3: Persist sync map to device ───────────────────────
+                    for case in self._to_update:
+                        device_case_id = case["device_case_id"]
+                        _log.info("  Updating case: %s (device id %s)", case["name"], device_case_id)
+                        old_locations = device.get_case_track_locations(device_case_id)
+                        track_ids = push_tracks(case)
+                        device.rename_case(device_case_id, case["name"])
+                        device.reorder_case_tracks(device_case_id, track_ids)
+                        dropped = old_locations - device.get_case_track_locations(device_case_id)
+                        self._delete_device_files(
+                            device.delete_orphan_tracks(list(dropped)), self._device_db
+                        )
+
+                    for case in self._to_add:
+                        device_case_id = device.create_case(case["name"])
+                        self._sync_map[str(case["case_id"])] = device_case_id
+                        track_ids = push_tracks(case)
+                        for track_id in track_ids:
+                            device.link_track_to_case(device_case_id, track_id)
+                        pushed_to_new_cases += len(track_ids)
+
+            # ── Phase 4: Persist sync map to device ───────────────────────
             _write_sync_map(self._device_db, self._sync_map)
 
             parts = []
             if self._to_add:
                 parts.append(
                     f"Added {len(self._to_add)} case(s) "
-                    f"({done - skipped} tracks copied)"
+                    f"({pushed_to_new_cases} tracks copied)"
                 )
+            if self._to_update:
+                parts.append(f"Updated {len(self._to_update)} case(s)")
             if removed:
                 parts.append(f"Removed {removed} case(s) from device")
             if skipped:
@@ -983,6 +1034,7 @@ class M3U8ImportDialog(QDialog):
 
         try:
             with PacemakerWriter(self._db_path) as writer:
+                case_name = writer.unique_case_name(case_name)
                 case_id, locations = writer.add_playlist(case_name, tracks)
             QMessageBox.information(
                 self, "Done",
@@ -1478,11 +1530,11 @@ class MainWindow(QMainWindow):
         """
         Build a compact, screen-friendly case name from folder path parts.
 
-        Format:  folder segments joined with "_" (each stripped + 3 chars)
+        Format:  folder segments joined with "_" (each stripped + 4 chars)
                  + "_" + playlist name (stripped, spaces removed, 12 chars)
 
         Example: ["2025", "08 - Aug", "IYKYK", "Deep or Heavy"]
-              →  "2025_Aug_IYK_DeaporHeavy"  (approx)
+              →  "2025_Aug_IYKY_DeeporHeavy"
 
         Root-level playlists (no folders) are kept as-is, truncated to 24 chars.
         """
@@ -1512,7 +1564,7 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "No Database", "Please select an Editor database first.")
             return
 
-        checked_ids = set(self._tree.get_checked_playlist_ids())
+        checked_ids = self._tree.get_checked_playlist_ids()
         if not checked_ids:
             QMessageBox.information(self, "Nothing to do", "No playlists are checked.")
             return
@@ -1520,17 +1572,26 @@ class MainWindow(QMainWindow):
         path_map = self._build_playlist_path_map()
         operations = []
 
-        for pid in checked_ids:
-            node = self._find_node(pid)
-            if node is None:
-                continue
-            case_name = self._make_case_name(path_map.get(pid, [node.name]))
-            tracks = self._rb_reader.get_playlist_tracks(pid)
-            operations.append({
-                "playlist_id": pid,
-                "playlist_name": case_name,
-                "tracks": tracks,
-            })
+        with PacemakerWriter(db_path) as writer:
+            names_in_batch: set[str] = set()
+            for pid in checked_ids:
+                node = self._find_node(pid)
+                if node is None:
+                    continue
+                base_name = self._make_case_name(path_map.get(pid, [node.name]))
+                # Shortened names can collide, with existing cases or within this batch
+                case_name = writer.unique_case_name(base_name)
+                suffix = 2
+                while case_name.casefold() in names_in_batch:
+                    case_name = writer.unique_case_name(f"{base_name}_{suffix}")
+                    suffix += 1
+                names_in_batch.add(case_name.casefold())
+                tracks = self._rb_reader.get_playlist_tracks(pid)
+                operations.append({
+                    "playlist_id": pid,
+                    "playlist_name": case_name,
+                    "tracks": tracks,
+                })
 
         if not operations:
             return
@@ -1625,22 +1686,50 @@ class MainWindow(QMainWindow):
         sync_map = _read_sync_map(device_db)
         synced_editor_ids = {int(k) for k in sync_map}
 
-        # Diff: new cases to push, existing cases to remove
+        # Diff the ticks against what's really on the device: new cases to push, cases
+        # to remove, and cases on the device that no longer match the Editor Library.
         to_add = [
             editor_case_by_id[eid] for eid in checked_ids
             if eid not in synced_editor_ids and eid in editor_case_by_id
         ]
-        to_remove = [
-            {
-                "editor_case_id": int(k),
-                "device_case_id": v,
-                "name": editor_case_by_id.get(int(k), {}).get("name", str(k)),
-            }
-            for k, v in sync_map.items()
-            if int(k) not in checked_ids
-        ]
+        to_remove: list[dict] = []
+        to_update: list[dict] = []
+        try:
+            with PacemakerWriter(device_db) as device, PacemakerWriter(editor_db) as editor:
+                device_names = {c["case_id"]: c["name"] for c in device.get_all_cases()}
+                for key, device_case_id in list(sync_map.items()):
+                    editor_case_id = int(key)
+                    exists_on_device = device_case_id in device_names
+                    if editor_case_id not in checked_ids:
+                        if exists_on_device:
+                            to_remove.append({
+                                "editor_case_id": editor_case_id,
+                                "device_case_id": device_case_id,
+                                "name": device_names[device_case_id],
+                            })
+                        else:
+                            del sync_map[key]   # already gone from the device
+                    elif not exists_on_device:
+                        del sync_map[key]       # ticked, so put it back
+                        to_add.append(editor_case_by_id[editor_case_id])
+                    else:
+                        case = editor_case_by_id[editor_case_id]
+                        expected = DeviceSyncWorker.expected_locations(
+                            editor.get_case_tracks_as_trackinfo(editor_case_id), device_db
+                        )
+                        if (case["name"] != device_names[device_case_id]
+                                or expected != device.get_ordered_case_track_locations(device_case_id)):
+                            to_update.append({**case, "device_case_id": device_case_id})
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Could not read the Pacemaker:\n\n{e}")
+            return
 
-        if not to_add and not to_remove:
+        if to_remove or to_update:
+            if not self._confirm_device_changes(to_add, to_remove, to_update):
+                return
+
+        if not to_add and not to_remove and not to_update:
+            _write_sync_map(device_db, sync_map)   # entries for deleted cases may have gone
             # Count unsynced cases the user hasn't checked yet
             unsynced_unchecked = [
                 eid for eid in editor_case_by_id
@@ -1654,15 +1743,43 @@ class MainWindow(QMainWindow):
             self.statusBar().showMessage(f"Device already in sync with checked cases.{hint}")
             return
 
-        self._run_device_sync(editor_db, device_db, to_add, to_remove, sync_map)
+        self._run_device_sync(editor_db, device_db, to_add, to_remove, to_update, sync_map)
+
+    def _confirm_device_changes(self, to_add: list, to_remove: list, to_update: list) -> bool:
+        """Ask before changing what's already on the device. Returns True to go ahead."""
+        def section(heading: str, cases: list) -> str:
+            limit = 10
+            names = [f"  • {c['name']}" for c in cases[:limit]]
+            if len(cases) > limit:
+                names.append(f"  …and {len(cases) - limit} more")
+            return heading + "\n" + "\n".join(names)
+
+        sections = []
+        if to_remove:
+            sections.append(section(
+                "Remove from the Pacemaker, including music files no other case uses:", to_remove
+            ))
+        if to_update:
+            sections.append(section("Update to match your Editor Library:", to_update))
+        if to_add:
+            sections.append(section("Add to the Pacemaker:", to_add))
+
+        title = "Remove Cases from Pacemaker?" if to_remove else "Update Cases on Pacemaker?"
+        reply = QMessageBox.question(
+            self, title,
+            "\n\n".join(sections) + "\n\nContinue?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return reply == QMessageBox.StandardButton.Yes
 
     def _run_device_sync(self, editor_db: str, device_db: str,
-                         to_add: list, to_remove: list, sync_map: dict):
+                         to_add: list, to_remove: list, to_update: list, sync_map: dict):
         self._editor_panel.setEnabled(False)
         self._device_panel.setEnabled(False)
         self._editor_panel.push_button.setEnabled(False)
 
-        total_tracks = sum(c.get("track_count", 0) for c in to_add)
+        total_tracks = sum(c.get("track_count", 0) for c in to_add + to_update)
         self._push_progress_dlg = QProgressDialog(
             "Syncing to device…", None, 0, max(total_tracks, 1), self
         )
@@ -1673,7 +1790,7 @@ class MainWindow(QMainWindow):
         self._push_progress_dlg.show()
 
         self._push_thread = QThread()
-        self._push_worker = DeviceSyncWorker(editor_db, device_db, to_add, to_remove, sync_map)
+        self._push_worker = DeviceSyncWorker(editor_db, device_db, to_add, to_remove, to_update, sync_map)
         self._push_worker.moveToThread(self._push_thread)
 
         self._push_thread.started.connect(self._push_worker.run)
@@ -2117,6 +2234,9 @@ class MainWindow(QMainWindow):
 
             try:
                 with PacemakerWriter(db_path) as writer:
+                    if writer.case_name_exists(new_name, ignore_case_id=case["case_id"]):
+                        self._warn_duplicate_case_name(new_name)
+                        continue
                     writer.rename_case(case["case_id"], new_name)
                 self.statusBar().showMessage(f'Renamed "{case["name"]}" → "{new_name}".')
             except Exception as e:
@@ -2132,6 +2252,10 @@ class MainWindow(QMainWindow):
             return
         try:
             with PacemakerWriter(db_path) as writer:
+                if writer.case_name_exists(new_name, ignore_case_id=case_id):
+                    self._warn_duplicate_case_name(new_name)
+                    self._load_editor_library()   # put the old name back in the list
+                    return
                 writer.rename_case(case_id, new_name)
             _logger.log.info("Renamed editor case %d to %r (inline)", case_id, new_name)
             self.statusBar().showMessage(f'Renamed to "{new_name}".')
@@ -2139,6 +2263,12 @@ class MainWindow(QMainWindow):
         except Exception as e:
             _logger.log.error("Inline rename failed: %s", e, exc_info=True)
             QMessageBox.critical(self, "Rename Failed", str(e))
+
+    def _warn_duplicate_case_name(self, name: str) -> None:
+        QMessageBox.warning(
+            self, "Name Already Used",
+            f'There\'s already a case called "{name}". Please choose a different name.',
+        )
 
     def _on_new_case_requested(self) -> None:
         """Handle the Editor panel's "New Case" button."""
@@ -2152,6 +2282,9 @@ class MainWindow(QMainWindow):
             return
         try:
             with PacemakerWriter(db_path) as writer:
+                if writer.case_name_exists(name):
+                    self._warn_duplicate_case_name(name)
+                    return
                 writer.create_case(name)
             self._load_editor_library()
             self.statusBar().showMessage(f"Created case \"{name}\".")
@@ -2352,11 +2485,21 @@ class MainWindow(QMainWindow):
         self._editor_panel.push_button.setEnabled(True)
 
     def _on_delete_device_case(self, cases: list):
+        device_db = self._device_panel.db_path
+        deleted_ids = {c["case_id"] for c in cases}
+
+        def _refresh():
+            # Forget the deleted cases, so their Editor ticks clear rather than the
+            # next Sync treating them as still wanted and putting them straight back.
+            sync_map = _read_sync_map(device_db)
+            _write_sync_map(device_db, {k: v for k, v in sync_map.items() if v not in deleted_ids})
+            self._load_device_library()
+
         self._delete_cases(
-            db_path=self._device_panel.db_path,
+            db_path=device_db,
             cases=cases,
             update_sync_state=False,
-            refresh_fn=lambda: self._load_device_library(),
+            refresh_fn=_refresh,
         )
 
     def _eject_device(self):

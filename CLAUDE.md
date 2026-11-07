@@ -159,7 +159,9 @@ Track deduplication is by `location` (file path). Tracks shared across cases are
 
 `HHHHHHHH` is the CRC32 of the source file's full path, and `X`/`Y` are its first two hex characters. Because the source path differs between computers, the same file pushed from two machines is copied twice.
 
-**Push process** (`DevicePushWorker`):
+**Ticks mean "should be on the device"**, and `rb_sync_map.json` on the device maps Editor case IDs to device case IDs. `_confirm_and_sync_to_device` compares the ticks and the actual device contents, then makes three lists: add, remove, and update (a ticked case whose name or ordered tracks differ). It asks for confirmation before any remove or update, but not for adds alone.
+
+**Push process** (`DeviceSyncWorker`):
 1. For each checked Editor case, reads tracks via `get_case_tracks_as_trackinfo()`
 2. `_copy_track` copies each file to the path above (skipped if it exists with the same size) and creates the `.str` file
 3. Uses `dataclasses.replace(track, location=pmdb_location)` to create the device TrackInfo
@@ -174,14 +176,15 @@ Rekordbox has folders; Pacemaker has no folder concept. Case names are auto-gene
 
 ```
 ["2025", "08 - Aug", "IYKYK", "Deep or Heavy"]
-→  "2025_Aug_IYK_DeaporHeavy"
+→  "2025_Aug_IYKY_DeeporHeavy"
 ```
 
 Rules (`_make_case_name` in `main_window.py`):
-- Folder segments: strip leading ordinal prefix (`08 - ` → `Aug`), take first 3 chars
+- Folder segments: strip leading ordinal prefix (`08 - ` → `Aug`), take first 4 chars
 - Playlist name: strip ordinal prefix, remove spaces, take first 12 chars
 - Join all with `_`
 - Root-level playlists (no folders): kept as-is, truncated to 24 chars with `…`
+- If the name is already taken (ignoring upper/lower case), `_2`, `_3`… is added. New Case and rename refuse a duplicate instead.
 
 Cases can be renamed manually in the Editor Library panel (double-click or Rename button).
 
@@ -228,9 +231,10 @@ The tree no longer pre-checks previously synced playlists. `_refresh_tree()` pas
 - Signals: `progress(int, int, str)`, `finished(bool, str)`
 - `run()`: iterates operations, calls `writer.add_playlist(name, tracks, cb)` for each
 
-**`DevicePushWorker(QObject)`** — Editor → Device push thread
+**`DeviceSyncWorker(QObject)`** — Editor → Device push thread
 - Signals: `progress(int, int, str)`, `finished(bool, str)`
 - `__init__(editor_db, device_db, cases)`: `cases` is list of `{"case_id", "name", "track_count", ...}`
+- `expected_locations(tracks, device_db)`: what a case should hold on the device. Tracks whose source is missing stay if their copy is already there, so an unplugged music drive doesn't strip them
 - `_copy_track(src_path, device_db) -> (local_dest, pmdb_location)` (static): copies file, skips if same size exists, creates the `.str` companion
 - `run()`: copies files, writes device-path tracks to device DB, per-track progress
 
