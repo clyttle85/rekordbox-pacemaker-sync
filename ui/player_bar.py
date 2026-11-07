@@ -11,6 +11,8 @@ Contains:
 
 from __future__ import annotations
 
+import os
+
 from PyQt6.QtCore import Qt, QUrl, pyqtSignal, QTimer, QThread, QObject
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel,
@@ -24,7 +26,8 @@ try:
 except ImportError:
     _MULTIMEDIA_OK = False
 
-from core.rekordbox_reader import TrackInfo
+from core.logger import log as _log
+from core.rekordbox_reader import RekordboxReader, TrackInfo
 
 # Waveform color palette (PWAV color codes 0-7)
 _WAVE_COLORS = [
@@ -51,18 +54,29 @@ def _fmt(ms: int) -> str:
 # ---------------------------------------------------------------------------
 
 class _WaveformLoader(QObject):
-    done = pyqtSignal(object)  # list[tuple[int,int]] or None
+    done = pyqtSignal(int, object)  # generation, list[tuple[int,int]] or None
 
-    def __init__(self, rb_reader, location: str):
+    def __init__(self, generation: int, location: str):
         super().__init__()
-        self._reader = rb_reader
+        self._generation = generation
         self._location = location
 
     def run(self):
+        # Its own reader: SQLAlchemy sessions can't be shared between threads
         data = None
-        if self._reader:
-            data = self._reader.get_waveform_data(self._location)
-        self.done.emit(data)
+        reader = None
+        try:
+            reader = RekordboxReader()
+            data = reader.get_waveform_data(self._location)
+        except Exception as e:
+            _log.error("Waveform load failed for %s: %s", self._location, e)
+        finally:
+            if reader is not None:
+                try:
+                    reader.close()
+                except Exception:
+                    pass
+        self.done.emit(self._generation, data)
 
 
 # ---------------------------------------------------------------------------
@@ -146,6 +160,7 @@ class PlayerBar(QWidget):
     """Top-of-window audio player bar with waveform display."""
 
     track_changed = pyqtSignal(int)   # index into current playlist
+    playback_error = pyqtSignal(str)  # message for the user
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -153,8 +168,14 @@ class PlayerBar(QWidget):
         self._current: int = -1
         self._seeking: bool = False
         self._rb_reader = None         # set by MainWindow after load
-        self._waveform_thread = None
-        self._waveform_worker = None
+        self._waveform_generation = 0
+        self._waveform_location = ""
+        self._waveform_threads: list = []   # (thread, worker) pairs still running
+        # Wait for skipping to settle, so pressing Next repeatedly doesn't start a load each time
+        self._waveform_timer = QTimer(self)
+        self._waveform_timer.setSingleShot(True)
+        self._waveform_timer.setInterval(200)
+        self._waveform_timer.timeout.connect(self._start_waveform_load)
 
         if _MULTIMEDIA_OK:
             self._player = QMediaPlayer()
@@ -165,6 +186,7 @@ class PlayerBar(QWidget):
             self._player.durationChanged.connect(self._on_duration)
             self._player.playbackStateChanged.connect(self._on_state)
             self._player.mediaStatusChanged.connect(self._on_media_status)
+            self._player.errorOccurred.connect(self._on_player_error)
         else:
             self._player = None
             self._audio_out = None
@@ -177,7 +199,7 @@ class PlayerBar(QWidget):
     # ------------------------------------------------------------------
 
     def set_rekordbox_reader(self, reader) -> None:
-        """Provide the RekordboxReader so waveforms can be loaded."""
+        """Waveforms are only looked up once a Rekordbox library has loaded."""
         self._rb_reader = reader
 
     def load_and_play(self, tracks: list[TrackInfo], start_index: int = 0) -> None:
@@ -188,6 +210,25 @@ class PlayerBar(QWidget):
         """Stop playback without clearing the loaded track."""
         if self._player:
             self._player.stop()
+
+    def release_if_under(self, root: str) -> None:
+        """Let go of the current file if it's under this folder, e.g. a device being ejected."""
+        if not (self._player and 0 <= self._current < len(self._tracks)):
+            return
+        location = os.path.normcase(os.path.abspath(self._tracks[self._current].location))
+        if location.startswith(os.path.normcase(os.path.abspath(root))):
+            self._player.stop()
+            self._player.setSource(QUrl())
+
+    def shut_down(self) -> None:
+        """Stop playback and wait for waveform threads: destroying a running QThread aborts the app."""
+        self._waveform_timer.stop()
+        self._waveform_generation += 1
+        if self._player:
+            self._player.stop()
+        for thread, _worker in list(self._waveform_threads):
+            thread.quit()
+            thread.wait(5000)
 
     def highlight_index(self, index: int) -> None:
         self._current = index
@@ -286,28 +327,46 @@ class PlayerBar(QWidget):
         track = self._tracks[index]
         self._update_info()
         self._waveform.clear()
+        for btn in (self._play_btn, self._prev_btn, self._next_btn):
+            btn.setEnabled(True)
+        if not os.path.exists(track.location):
+            if self._player:
+                self._player.stop()
+            self.playback_error.emit(f"File not found: {track.location}")
+            return
         if self._player:
             self._player.setSource(QUrl.fromLocalFile(track.location))
             self._player.play()
-        for btn in (self._play_btn, self._prev_btn, self._next_btn):
-            btn.setEnabled(True)
         self.track_changed.emit(index)
         self._load_waveform(track.location)
 
     def _load_waveform(self, location: str) -> None:
+        self._waveform_generation += 1   # any load still running is now out of date
         if not self._rb_reader:
             return
-        # Run in a thread so DB access doesn't block the UI
-        self._waveform_thread = QThread()
-        self._waveform_worker = _WaveformLoader(self._rb_reader, location)
-        self._waveform_worker.moveToThread(self._waveform_thread)
-        self._waveform_thread.started.connect(self._waveform_worker.run)
-        self._waveform_worker.done.connect(self._on_waveform_loaded)
-        self._waveform_worker.done.connect(self._waveform_thread.quit)
-        self._waveform_thread.start()
+        self._waveform_location = location
+        self._waveform_timer.start()
 
-    def _on_waveform_loaded(self, data) -> None:
-        self._waveform.set_waveform(data)
+    def _start_waveform_load(self) -> None:
+        thread = QThread()
+        worker = _WaveformLoader(self._waveform_generation, self._waveform_location)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.done.connect(self._on_waveform_loaded)
+        worker.done.connect(thread.quit)
+
+        def forget(pair=(thread, worker)):
+            if pair in self._waveform_threads:
+                self._waveform_threads.remove(pair)
+
+        thread.finished.connect(forget)
+        # Keep a reference until it's finished: a running QThread must not be destroyed
+        self._waveform_threads.append((thread, worker))
+        thread.start()
+
+    def _on_waveform_loaded(self, generation: int, data) -> None:
+        if generation == self._waveform_generation:
+            self._waveform.set_waveform(data)
 
     def _play_next(self) -> None:
         if self._tracks and self._current < len(self._tracks) - 1:
@@ -359,6 +418,10 @@ class PlayerBar(QWidget):
         self._play_btn.setText(
             "⏸" if state == QMediaPlayer.PlaybackState.PlayingState else "▶"
         )
+
+    def _on_player_error(self, error, text: str) -> None:
+        if error != QMediaPlayer.Error.NoError:
+            self.playback_error.emit(f"Couldn't play this track: {text}")
 
     def _on_media_status(self, status) -> None:
         if status == QMediaPlayer.MediaStatus.EndOfMedia:

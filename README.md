@@ -18,8 +18,9 @@ Rekordbox Library  →  Editor Library  →  Device Library
 ## Features
 
 - Tristate checkbox tree of Rekordbox folders/playlists, with expansion state remembered between sessions
-- Sync checked playlists into a local Editor library
-- Push Editor cases to a connected Pacemaker, copying audio files and writing device-local paths
+- Import checked playlists into a local Editor library
+- Sync Editor cases to a connected Pacemaker, copying audio files and writing device-local paths, with warnings before anything is removed, overwritten or won't fit
+- Backs up the Pacemaker's database to your computer before changing it
 - Drag and drop audio files/folders from Explorer/Finder straight into the library, optionally directly into a case
 - Create cases by hand, drag tracks onto a case to add them, drag within an open case to reorder, remove tracks from a case without deleting them from the library
 - Rename, delete, and browse cases in both the Editor and Device libraries
@@ -83,7 +84,10 @@ main.py                    # Entry point
 core/
   rekordbox_reader.py       # Reads Rekordbox master.db via pyrekordbox
   pacemaker_writer.py        # Reads/writes Pacemaker music.db (SQLite)
-  sync_state.py              # Tracks which Editor cases are on which device
+  sync_state.py              # Older record of synced playlists
+  sync_map.py                # Tracks which Editor cases are on which device
+  device_backup.py           # Backs up a device's database before changes
+  audio_formats.py           # Which audio formats can be imported
   device_finder.py           # Auto-detects Editor/Device DB paths (cross-platform);
                               #   device_root()/device_music_root()/is_on_device()
                               #   helpers used throughout for device-relative paths

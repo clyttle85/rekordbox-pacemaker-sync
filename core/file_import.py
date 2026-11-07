@@ -1,49 +1,40 @@
 """
-Drag-and-drop file import — reads audio files/folders dropped from Windows
-Explorer and extracts track metadata using Mutagen (via m3u8_reader's
-file-level reader, which is not actually M3U8-specific).
+Drag-and-drop file import: expands audio files and folders dropped from the file manager
+and reads their details with Mutagen (via m3u8_reader's file-level reader).
 """
 
 from __future__ import annotations
 
 import os
 
-from core.m3u8_reader import read_track_metadata
+from core.audio_formats import ALL_AUDIO_EXTENSIONS, extension, is_supported, normalise_location
+from core.m3u8_reader import AudioFileError, read_track_metadata
 from core.rekordbox_reader import TrackInfo
 
-AUDIO_EXTENSIONS = {
-    ".mp3", ".flac", ".m4a", ".mp4", ".wma", ".aac", ".ogg", ".wav", ".aif", ".aiff",
-}
 
-
-def expand_dropped_paths(paths: list[str]) -> list[str]:
+def expand_dropped_paths(paths: list[str]) -> tuple[list[str], list[str]]:
     """
-    Expand a list of dropped file/folder paths into a flat list of audio
-    file paths. Folders are walked recursively; non-audio files are dropped.
+    Expand dropped file/folder paths into (supported, unsupported) audio file paths.
+    Folders are walked recursively. Files that aren't audio are ignored.
     """
-    files: list[str] = []
+    found: list[str] = []
     for path in paths:
         if os.path.isdir(path):
             for root, _dirs, names in os.walk(path):
-                for name in names:
-                    if os.path.splitext(name)[1].lower() in AUDIO_EXTENSIONS:
-                        files.append(os.path.join(root, name))
-        elif os.path.splitext(path)[1].lower() in AUDIO_EXTENSIONS:
-            files.append(path)
-    return files
+                found.extend(os.path.join(root, name) for name in names)
+        else:
+            found.append(path)
+    audio = [normalise_location(p) for p in found if extension(p) in ALL_AUDIO_EXTENSIONS]
+    return [p for p in audio if is_supported(p)], [p for p in audio if not is_supported(p)]
 
 
-def read_tracks_from_paths(paths: list[str]) -> tuple[list[TrackInfo], list[str]]:
-    """
-    Expand and read metadata for a list of dropped file/folder paths.
-    Returns (tracks, errors) — errors is the list of files that failed to read.
-    """
-    files = expand_dropped_paths(paths)
+def read_tracks_from_files(files: list[str]) -> tuple[list[TrackInfo], list[str]]:
+    """Read each file's details. Returns (tracks, problems), each problem being "path: reason"."""
     tracks: list[TrackInfo] = []
-    errors: list[str] = []
-    for fp in files:
+    problems: list[str] = []
+    for path in files:
         try:
-            tracks.append(read_track_metadata(fp))
-        except Exception:
-            errors.append(fp)
-    return tracks, errors
+            tracks.append(read_track_metadata(path))
+        except AudioFileError as e:
+            problems.append(f"{path}: {e}")
+    return tracks, problems

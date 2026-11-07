@@ -97,7 +97,7 @@ class SyncPanel(QWidget):
         layout.addWidget(self._status_label)
 
         # --- Sync button (not added to this layout — placed externally by MainWindow) ---
-        self._sync_btn = QPushButton("Sync to\nEditor Library")
+        self._sync_btn = QPushButton("Import to\nEditor Library")
         self._sync_btn.setFixedHeight(50)
         font = self._sync_btn.font()
         font.setBold(True)
@@ -176,7 +176,7 @@ class SyncPanel(QWidget):
         if syncing:
             self._sync_btn.setText("Syncing…")
         else:
-            self._sync_btn.setText("Sync to\nEditor Library")
+            self._sync_btn.setText("Import to\nEditor Library")
             self._refresh_sync_button()
 
     # ------------------------------------------------------------------

@@ -11,14 +11,58 @@ Handles:
 
 from __future__ import annotations
 
+import secrets
 import sqlite3
 import os
+import time
 from typing import Callable, Optional
 
 from core.rekordbox_reader import TrackInfo
 
 CREATOR_ID = "Tonium;Editor;2.0.2.14170;1117277940118978560"
 CASE_YEAR = 2024
+
+# TrackInfo fields a re-import or sync brings up to date -> the columns holding them
+_DETAIL_COLUMNS = {
+    "title": ("title", "ind_title"),
+    "artist": ("artist", "ind_artist"),
+    "album": ("album", "ind_album"),
+    "album_artist": ("album_artist",),
+    "composer": ("composer",),
+    "genre": ("genre", "ind_genre"),
+    "label": ("label",),
+    "producer": ("producer",),
+    "remixer": ("remixer",),
+    "key": ("key",),
+    "year": ("year",),
+    "comments": ("comments",),
+    "bpm": ("bpm", "ind_bpm"),
+    "rating": ("rating",),
+    "track_number": ("track_number",),
+    "number_of_tracks": ("number_of_tracks",),
+    "disc_number": ("disc_number",),
+    "number_of_discs": ("number_of_discs",),
+    "bit_rate": ("bit_rate",),
+    "sample_rate": ("sample_rate",),
+    "play_time_secs": ("play_time_secs",),
+    "file_size": ("file_size",),
+    "format": ("format",),
+}
+
+
+def _same_value(old, new) -> bool:
+    return old == new or str(old) == str(new)
+
+
+def track_details_differ(new: TrackInfo, existing: TrackInfo) -> bool:
+    """
+    True if new has details that existing lacks or disagrees with. Blank values never
+    count: not every source knows every detail, so they don't erase what's there.
+    """
+    return any(
+        getattr(new, field) and not _same_value(getattr(existing, field), getattr(new, field))
+        for field in _DETAIL_COLUMNS
+    )
 
 
 class PacemakerWriter:
@@ -29,6 +73,20 @@ class PacemakerWriter:
 
     def close(self):
         self._conn.close()
+
+    def library_id(self) -> int:
+        """
+        A random ID for this database, issued the first time it's asked for. It lives in
+        the SQLite header's application_id, so it adds no tables to a database the Tonium
+        Editor shares, and a recreated database gets a new one.
+        """
+        current = self._conn.execute("PRAGMA application_id").fetchone()[0]
+        if current:
+            return current
+        new_id = secrets.randbits(31) | 1
+        self._conn.execute(f"PRAGMA application_id = {new_id}")
+        self._conn.commit()
+        return new_id
 
     def __enter__(self):
         return self
@@ -113,18 +171,39 @@ class PacemakerWriter:
     # Track operations
     # ------------------------------------------------------------------
 
-    def insert_or_get_track(self, track: TrackInfo) -> int:
+    def _refresh_track_details(self, row: sqlite3.Row, track: TrackInfo) -> None:
+        """Update a track's details in place. Its ID is kept, so it stays in its cases."""
+        updates: dict = {}
+        for field, columns in _DETAIL_COLUMNS.items():
+            value = getattr(track, field)
+            if value and not _same_value(row[columns[0]], value):
+                updates.update({column: value for column in columns})
+        if updates:
+            updates["date_modified"] = int(time.time())
+            assignments = ", ".join(f"{column} = ?" for column in updates)
+            self._conn.execute(
+                f"UPDATE tracks SET {assignments} WHERE track_id = ?",
+                (*updates.values(), row["track_id"]),
+            )
+            self._conn.commit()
+
+    def insert_or_get_track(self, track: TrackInfo, date_source: Optional[str] = None) -> int:
         """
-        Return the track_id for a track. Inserts it if it doesn't exist yet.
-        Deduplication is by file location.
+        Return the track_id for a track. Inserts it if it doesn't exist yet, and brings
+        its details up to date if it does. Deduplication is by file location.
+
+        date_source is the file to take its dates from, for when track.location isn't a
+        path on this computer (device tracks hold firmware paths).
         """
         cursor = self._conn.cursor()
-        cursor.execute("SELECT track_id FROM tracks WHERE location = ?", (track.location,))
+        cursor.execute("SELECT * FROM tracks WHERE location = ?", (track.location,))
         row = cursor.fetchone()
         if row:
+            self._refresh_track_details(row, track)
             return row["track_id"]
 
-        date_added = int(os.path.getmtime(track.location)) if os.path.exists(track.location) else 0
+        dated_file = date_source or track.location
+        date_added = int(os.path.getmtime(dated_file)) if os.path.exists(dated_file) else 0
 
         values = (
             track.title, track.location, track.bit_rate, track.sample_rate,
@@ -333,6 +412,43 @@ class PacemakerWriter:
             for row in cursor.fetchall()
         ]
 
+    def get_track_by_location(self, location: str) -> Optional[TrackInfo]:
+        cursor = self._conn.cursor()
+        cursor.execute("SELECT * FROM tracks WHERE location = ?", (location,))
+        row = cursor.fetchone()
+        return self._row_to_trackinfo(row) if row else None
+
+    def get_case_ids_for_location(self, location: str) -> set[int]:
+        """Every case that holds the track at this location."""
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT ct.case_id FROM casetracks ct
+            JOIN tracks t ON t.track_id = ct.track_id
+            WHERE t.location = ?
+        """, (location,))
+        return {row["case_id"] for row in cursor.fetchall()}
+
+    def get_case_track_sizes(self) -> dict[int, dict[str, int]]:
+        """{case_id: {location: file_size}} for every case."""
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT ct.case_id, t.location, t.file_size FROM casetracks ct
+            JOIN tracks t ON t.track_id = ct.track_id
+        """)
+        sizes: dict[int, dict[str, int]] = {}
+        for row in cursor.fetchall():
+            sizes.setdefault(row["case_id"], {})[row["location"]] = row["file_size"] or 0
+        return sizes
+
+    def delete_all_unreferenced_tracks(self) -> list[str]:
+        """Delete every track in no case. Returns their locations."""
+        cursor = self._conn.cursor()
+        cursor.execute("""
+            SELECT location FROM tracks
+            WHERE track_id NOT IN (SELECT track_id FROM casetracks)
+        """)
+        return self.delete_orphan_tracks([row["location"] for row in cursor.fetchall()])
+
     def get_track_id_by_location(self, location: str) -> Optional[int]:
         """Return the track_id for a track at this file location, or None."""
         cursor = self._conn.cursor()
@@ -363,7 +479,8 @@ class PacemakerWriter:
         Rewrite a case's track order to match the given sequence of track_ids
         (order is implied by casetracks insertion order — see
         get_case_tracks_as_trackinfo's `ORDER BY ct.rowid`). Does not change
-        which tracks are in the case, only their order.
+        which tracks are in the case, only their order. A track_id listed twice is
+        in the case twice.
         """
         cursor = self._conn.cursor()
         cursor.execute("DELETE FROM casetracks WHERE case_id = ?", (case_id,))
