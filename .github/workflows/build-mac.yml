@@ -1,0 +1,174 @@
+name: Build macOS DMGs
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version for the DMG filename and app (e.g. 1.2.0). Leave blank for a dev build.
+        required: false
+        default: ""
+  push:
+    tags:
+      - "v*"
+    # TEMPORARY: lets the new workflow run from this branch. Remove before merging.
+    branches:
+      - mac-distribution
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build (${{ matrix.arch }})
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: arm64
+            runner: macos-15
+            machine: arm64
+          - arch: intel
+            runner: macos-15-intel
+            machine: x86_64
+    env:
+      APP_PATH: dist/RekordboxPacemakerSync.app
+      APP_BINARY: dist/RekordboxPacemakerSync.app/Contents/MacOS/RekordboxPacemakerSync
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-python@v7
+        with:
+          python-version: "3.12"
+
+      - name: Work out version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_VERSION: ${{ inputs.version }}
+          SHA: ${{ github.sha }}
+        run: |
+          if [ "$REF_TYPE" = "tag" ]; then
+            version="${REF_NAME#v}"
+          elif [ -n "$INPUT_VERSION" ]; then
+            version="$INPUT_VERSION"
+          else
+            version="dev-${SHA:0:7}"
+          fi
+          # Info.plist only allows dotted numbers, so 1.2.0-beta1 becomes 1.2.0
+          plist_version="$(printf '%s' "$version" | grep -Eo '^[0-9]+(\.[0-9]+){0,2}' || true)"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "APP_VERSION=${plist_version:-0.0.0}" >> "$GITHUB_ENV"
+          echo "DMG_NAME=RekordboxPacemakerSync-$version-${{ matrix.arch }}.dmg" >> "$GITHUB_ENV"
+
+      - name: Check this runner is the expected architecture
+        run: test "$(uname -m)" = "${{ matrix.machine }}"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt pyinstaller pillow
+
+      - name: Show installed versions
+        run: pip list | grep -iE '^(pyqt6|pyrekordbox|sqlcipher3|sqlalchemy|pyinstaller) '
+
+      - name: "Smoke test: source imports"
+        env:
+          QT_QPA_PLATFORM: offscreen
+          PYTHONPATH: .
+        run: |
+          python -c "from core import rekordbox_reader as r; assert r.PYREKORDBOX_AVAILABLE, r._IMPORT_ERROR"
+          python .github/scripts/import_all_modules.py
+
+      - name: Build app bundle
+        run: pyinstaller --noconfirm rekordbox_pacemaker_sync_mac.spec
+
+      - name: Check bundle architecture and minimum macOS
+        run: |
+          lipo -archs "$APP_BINARY" | tr ' ' '\n' | grep -qx "${{ matrix.machine }}"
+          vtool -show-build "$APP_BINARY" | grep -E 'minos|version ' || true
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist"
+          /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP_PATH/Contents/Info.plist" || true
+          # The real floor is the newest requirement among the bundled libraries
+          find "$APP_PATH/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -path '*.framework/Versions/*' \) -print0 \
+            | xargs -0 -n 50 vtool -show-build 2>/dev/null \
+            | awk '$1 == "minos" { print $2 }' | sort -V | uniq -c
+
+      - name: "Smoke test: built app self-check"
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: .github/scripts/run_with_timeout.sh 180 "$APP_BINARY" --selftest
+
+      - name: "Smoke test: built app stays running"
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          "$APP_BINARY" &
+          pid=$!
+          sleep 10
+          if ! kill -0 "$pid" 2>/dev/null; then
+            wait "$pid" && code=0 || code=$?
+            echo "::error::The app exited within 10 seconds (exit code $code)"
+            exit 1
+          fi
+          kill "$pid"
+          wait "$pid" 2>/dev/null || true
+
+      - name: Build DMG
+        run: |
+          staging="$RUNNER_TEMP/dmg"
+          mkdir -p "$staging"
+          ditto "$APP_PATH" "$staging/RekordboxPacemakerSync.app"
+          ln -s /Applications "$staging/Applications"
+          # hdiutil sometimes fails with "Resource busy" on hosted runners
+          for attempt in 1 2 3 4 5; do
+            if hdiutil create -volname "Rekordbox Pacemaker Sync" -srcfolder "$staging" \
+                -fs HFS+ -format UDZO -ov "dist/$DMG_NAME"; then
+              exit 0
+            fi
+            echo "hdiutil failed on attempt $attempt, retrying"
+            sleep $((attempt * 10))
+          done
+          exit 1
+
+      - name: "Smoke test: app inside the DMG"
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: |
+          hdiutil verify "dist/$DMG_NAME"
+          mount_point="$RUNNER_TEMP/mounted-dmg"
+          hdiutil attach "dist/$DMG_NAME" -nobrowse -readonly -mountpoint "$mount_point"
+          test "$(readlink "$mount_point/Applications")" = "/Applications"
+          status=0
+          .github/scripts/run_with_timeout.sh 180 \
+            "$mount_point/RekordboxPacemakerSync.app/Contents/MacOS/RekordboxPacemakerSync" --selftest || status=$?
+          hdiutil detach "$mount_point" || hdiutil detach -force "$mount_point"
+          exit "$status"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.DMG_NAME }}
+          path: dist/${{ env.DMG_NAME }}
+          if-no-files-found: error
+          # A DMG is already compressed
+          compression-level: 0
+
+  release:
+    name: Attach DMGs to GitHub Release
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dmgs
+          pattern: RekordboxPacemakerSync-*
+          merge-multiple: true
+
+      - uses: softprops/action-gh-release@v3
+        with:
+          files: dmgs/*.dmg
+          fail_on_unmatched_files: true
+          generate_release_notes: true

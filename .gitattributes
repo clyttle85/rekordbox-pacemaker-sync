@@ -1,0 +1,3 @@
+# Run by macOS, where a CRLF shebang line fails with "bad interpreter"
+*.command text eol=lf
+*.sh text eol=lf
