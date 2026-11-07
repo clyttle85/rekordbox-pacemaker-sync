@@ -10,6 +10,8 @@ import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
+from core.logger import log as _log
+
 _IMPORT_ERROR: str = ""
 try:
     # pyrekordbox 0.5 renamed pyrekordbox.db6 to pyrekordbox.masterdb and requires
@@ -216,9 +218,26 @@ class RekordboxReader:
                 for c in sorted(children, key=lambda p: p.Seq or 0)
             ]
         else:
-            node.track_count = len(pl.Songs) if pl.Songs else 0
+            node.track_count = len(self._playlist_contents(pl))
 
         return node
+
+    def _playlist_contents(self, pl) -> list:
+        """A playlist's DjmdContent rows, in playlist order."""
+        if pl.is_smart_playlist:
+            # Intelligent playlists have no stored songs: Rekordbox evaluates their
+            # rules on demand. They have no fixed order either, so sort by title.
+            try:
+                contents = self._db.get_playlist_contents(pl).all()
+            except Exception as e:
+                _log.error("Could not evaluate intelligent playlist %r: %s", pl.Name, e, exc_info=True)
+                return []
+            return sorted(contents, key=lambda c: (c.Title or "").casefold())
+
+        # get_playlist_contents() loses track order for normal playlists: it uses
+        # ID.in_() with no ORDER BY. pl.Songs is the join table with TrackNo.
+        songs = sorted(pl.Songs or [], key=lambda s: s.TrackNo or 0)
+        return [song.Content for song in songs if song.Content is not None]
 
     def get_waveform_data(self, location: str) -> list[tuple[int, int]] | None:
         """
@@ -276,14 +295,8 @@ class RekordboxReader:
         if pl is None:
             return []
 
-        # get_playlist_contents() loses track order — it uses ID.in_() with no ORDER BY.
-        # pl.Songs is the DjmdSongPlaylist join table which has TrackNo for ordering.
-        songs = sorted(pl.Songs or [], key=lambda s: s.TrackNo or 0)
         tracks = []
-        for song in songs:
-            content = song.Content
-            if content is None:
-                continue
+        for content in self._playlist_contents(pl):
             if not content.FolderPath:
                 continue
 

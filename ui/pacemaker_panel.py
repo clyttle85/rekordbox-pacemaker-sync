@@ -516,7 +516,8 @@ class PacemakerLibraryPanel(QWidget):
         self._list.blockSignals(False)
 
         count = len(cases)
-        self._count_label.setText(f"{count} case{'s' if count != 1 else ''} on device.")
+        where = "on device" if self._show_storage else "in library"
+        self._count_label.setText(f"{count} case{'s' if count != 1 else ''} {where}.")
         if self._show_tabs:
             self._tab_widget.setTabText(0, f"Cases ({count})")
         self._delete_btn.setEnabled(False)
