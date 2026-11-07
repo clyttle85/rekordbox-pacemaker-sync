@@ -189,6 +189,11 @@ jobs:
           hdiutil detach "$mount_point" || hdiutil detach -force "$mount_point"
           exit "$status"
 
+      - name: "Smoke test: run-from-source script"
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: .github/scripts/run_with_timeout.sh 600 ./setup_mac.command --selftest
+
       - name: Remove signing keychain
         if: always() && env.HAS_APPLE_SECRETS == 'true'
         run: security delete-keychain "$RUNNER_TEMP/signing.keychain-db" || true

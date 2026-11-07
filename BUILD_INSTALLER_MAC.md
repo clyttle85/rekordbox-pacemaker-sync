@@ -1,107 +1,87 @@
 # Building the macOS App
 
-Everything below runs **on a Mac** — PyInstaller can't cross-compile, so none
-of this can be done from Windows. `icon.icns` is already generated and
-committed (converted from `D:\Downloads\icon.png` via Pillow on the Windows
-side), so that part's done.
+Mac builds run on GitHub Actions, because PyInstaller can't cross-compile from
+Windows. There's nothing to install locally unless you have a Mac and want to
+build there. To install the finished app, see [INSTALL_MAC.md](INSTALL_MAC.md).
 
-The Windows-specific code paths were ported to macOS in the same session this
-doc was written, but **none of it has been run on an actual Mac yet** — the
-steps below are the first real test. Expect at least one round of fixing
-`hiddenimports` or similar after the first build attempt; that's normal.
+## Building with GitHub Actions
 
-## Step 1 — Install dependencies
+`.github/workflows/build-mac.yml` builds one DMG per architecture:
+
+| DMG | Runner | For |
+|---|---|---|
+| `RekordboxPacemakerSync-<version>-arm64.dmg` | `macos-15` | Apple Silicon (M-series) |
+| `RekordboxPacemakerSync-<version>-intel.dmg` | `macos-15-intel` | Intel |
+
+- **Test build:** Actions → Build macOS DMGs → Run workflow (or
+  `gh workflow run build-mac.yml`). Optionally enter a version, otherwise the DMG
+  is named `dev-<commit>`. Download the DMGs from the run's Artifacts section.
+- **Release:** push a tag such as `v1.2.0`. The DMGs get version `1.2.0` and are
+  attached to a GitHub Release, which is created only if both builds pass.
+
+GitHub retires old macOS runner images, so if a job fails waiting for a runner,
+check the current labels in the
+[runner-images README](https://github.com/actions/runner-images#available-images).
+
+### What the smoke tests check
+
+A build fails unless all of these pass, on both architectures:
+
+1. Every module in `core/` and `ui/` imports from source.
+2. The bundle's binary is the expected architecture.
+3. `RekordboxPacemakerSync --selftest` passes in the bundle. It creates and reads an
+   encrypted `master.db` through the bundled pyrekordbox and SQLCipher, checks the
+   Qt Multimedia backend, then opens the main window for a few seconds. See
+   `core/selftest.py`. This is what catches missing `hiddenimports`.
+4. The bundled app, launched normally, is still running after 10 seconds.
+5. The same self-check passes from the app inside the mounted DMG.
+6. `setup_mac.command --selftest` passes from a clean checkout.
+
+They run headless on a machine with no Rekordbox or Pacemaker, so they can't
+replace testing on a real Mac with real hardware.
+
+## Building on a Mac
+
+Python 3.9 or newer works, and Python 3.11+ gets pyrekordbox 0.5. No Homebrew
+packages are needed: `sqlcipher3-wheels` ships prebuilt macOS binaries.
+
+### Step 1: Set up the environment
+
+Double-click `setup_mac.command`. It checks for `python3`, creates `.venv`,
+installs `requirements.txt`, and starts the app. If macOS offers to install the
+Command Line Developer Tools, accept, then double-click the file again. Use
+`run_mac.command` to start the app after that.
+
+If macOS won't run either file because it was downloaded in a ZIP, either
+`git clone` the repo or approve it under System Settings → Privacy & Security →
+Open Anyway. If it says you don't have permission, run
+`chmod +x setup_mac.command run_mac.command`.
+
+### Step 2: Build the app bundle
 
 ```bash
-# PyQt6, pyrekordbox, mutagen, sqlalchemy
-pip install -r requirements.txt
-
-# SQLCipher (for reading Rekordbox's encrypted master.db) — requirements.txt
-# deliberately excludes sqlcipher3-wheels on Mac since it's a Windows-only
-# prebuilt wheel. Install libsqlcipher via Homebrew first, then build the
-# Python binding against it:
-brew install sqlcipher
-pip install sqlcipher3-binary   # or: pip install sqlcipher3 (builds from source)
+.venv/bin/pip install pyinstaller pillow
+.venv/bin/pyinstaller --noconfirm rekordbox_pacemaker_sync_mac.spec
 ```
 
-If neither `sqlcipher3-binary` nor a from-source `sqlcipher3` install works
-cleanly, check pyrekordbox's own docs/issues for the currently-recommended
-macOS SQLCipher setup — this is the one dependency here that's genuinely
-OS-specific and the above is a best-effort starting point, not verified.
+This produces `dist/RekordboxPacemakerSync.app` for your Mac's architecture. Set
+`APP_VERSION=1.2.0` in the environment to set its version (the default is 0.0.0).
+
+### Step 3: Test it
 
 ```bash
-# One-time: let pyrekordbox find/derive the decryption key for your Rekordbox master.db
-python -m pyrekordbox setup
-```
-
-## Step 2 — Install PyInstaller and Pillow (if not already)
-
-```bash
-pip install pyinstaller pillow
-```
-
-## Step 3 — Build the app bundle
-
-```bash
-pyinstaller rekordbox_pacemaker_sync_mac.spec
-```
-
-Produces `dist/RekordboxPacemakerSync.app`. That's the whole deliverable —
-it's a normal double-clickable macOS app, runnable directly from `dist/` (or
-anywhere else) with **no install step and no need to move it into
-`/Applications`** — that's just a convention, never a requirement for `.app`
-bundles.
-
-## Step 4 — Run it
-
-```bash
+QT_QPA_PLATFORM=offscreen dist/RekordboxPacemakerSync.app/Contents/MacOS/RekordboxPacemakerSync --selftest
 open dist/RekordboxPacemakerSync.app
 ```
 
-or just double-click it in Finder.
+An app you built yourself isn't quarantined, so Gatekeeper won't block it on this
+Mac. It will on other people's Macs if it's unsigned.
 
-**Expect Gatekeeper to complain** the first time, since this build is
-unsigned: *"RekordboxPacemakerSync.app" cannot be opened because the
-developer cannot be verified.* Right-click → Open (instead of double-click)
-the first time bypasses this per-app. A real fix for end users needs code
-signing + notarization, which needs an Apple Developer ID ($99/year) — not
-set up here. `rekordbox_pacemaker_sync_mac.spec` has `codesign_identity=None`
-as a placeholder for when/if you set that up.
+## Rekordbox decryption key
 
-## Step 5 (optional) — Wrap it in a .dmg for distribution
-
-Not required to run the app (see Step 3) — only useful if you want a nicer
-single-file download for others. A plain `.zip` of the `.app` works just as
-well and is simpler:
-
-```bash
-# Option A: zip (simplest)
-cd dist && zip -r RekordboxPacemakerSync.zip RekordboxPacemakerSync.app
-
-# Option B: a proper disk image
-hdiutil create -volname "Rekordbox Pacemaker Sync" \
-  -srcfolder dist/RekordboxPacemakerSync.app \
-  -ov -format UDZO \
-  dist/RekordboxPacemakerSync.dmg
-```
-
-Either way, opening the result and double-clicking the `.app` inside runs it
-immediately — dragging to `/Applications` is optional, for anyone who wants
-it to persist/show up in Launchpad.
-
-## Rebuilding after code changes
-
-```bash
-pyinstaller rekordbox_pacemaker_sync_mac.spec
-```
-
-## File locations
-
-| File | Purpose |
-|---|---|
-| `icon.icns` | App icon (generated from `D:\Downloads\icon.png` via Pillow, on Windows) |
-| `rekordbox_pacemaker_sync_mac.spec` | PyInstaller build config for macOS |
-| `dist/RekordboxPacemakerSync.app` | The built app — run it directly |
+There's no setup step. Both supported pyrekordbox versions (0.4.4+ and 0.5.x)
+contain the key for `master.db`. Older instructions mention
+`python -m pyrekordbox setup`, which no longer exists.
 
 ## Turning on code signing and notarization
 
@@ -156,3 +136,13 @@ membership ($99/year). None of this needs a Mac:
 
 7. **Delete the private key files** from your computer once the secrets are saved,
    and update INSTALL_MAC.md to remove the "Open Anyway" steps.
+
+## File locations
+
+| File | Purpose |
+|---|---|
+| `.github/workflows/build-mac.yml` | The CI build |
+| `rekordbox_pacemaker_sync_mac.spec` | PyInstaller build config for macOS |
+| `packaging/mac/entitlements.plist` | Hardened-runtime exceptions for signed builds |
+| `icon.icns` | App icon |
+| `setup_mac.command`, `run_mac.command` | Run from source |
