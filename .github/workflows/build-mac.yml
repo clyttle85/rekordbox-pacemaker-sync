@@ -93,8 +93,8 @@ jobs:
           /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$APP_PATH/Contents/Info.plist"
           /usr/libexec/PlistBuddy -c 'Print :LSMinimumSystemVersion' "$APP_PATH/Contents/Info.plist" || true
           # The real floor is the newest requirement among the bundled libraries
-          find "$APP_PATH/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -path '*.framework/Versions/*' \) -print0 \
-            | xargs -0 -n 50 vtool -show-build 2>/dev/null \
+          find "$APP_PATH/Contents" -type f \( -name '*.dylib' -o -name '*.so' -o -path '*.framework/Versions/*' \) \
+            | while IFS= read -r file; do vtool -show-build "$file" 2>/dev/null || true; done \
             | awk '$1 == "minos" { print $2 }' | sort -V | uniq -c
 
       # Optional: needs an Apple Developer ID. Skipped until the secrets are set.
