@@ -8,6 +8,8 @@
 # is never at risk from Mac-specific changes.
 from __future__ import annotations
 
+from PyInstaller.utils.hooks import collect_submodules
+
 block_cipher = None
 
 a = Analysis(
@@ -18,11 +20,12 @@ a = Analysis(
         ('icon.icns', '.'),
     ],
     hiddenimports=[
-        'pyrekordbox',
-        'pyrekordbox.db6',
-        'pyrekordbox.db6.tables',
-        'pyrekordbox.db6.database',
+        # Covers either supported layout (0.4: pyrekordbox.db6, 0.5: .masterdb)
+        *collect_submodules('pyrekordbox'),
+        'sqlcipher3',
+        'sqlcipher3.dbapi2',
         'sqlalchemy.dialects.sqlite',
+        'sqlalchemy.dialects.sqlite.pysqlcipher',
         'sqlalchemy.pool',
         'mutagen',
         'mutagen.mp3',

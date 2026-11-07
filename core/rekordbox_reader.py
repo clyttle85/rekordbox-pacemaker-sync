@@ -5,17 +5,27 @@ tree structure for the UI to consume.
 """
 
 from __future__ import annotations
+import sys
 from dataclasses import dataclass, field
 from typing import Optional
 
 _IMPORT_ERROR: str = ""
 try:
-    from pyrekordbox import Rekordbox6Database as MasterDatabase
-    from pyrekordbox.db6.tables import DjmdPlaylist
+    # pyrekordbox 0.5 renamed pyrekordbox.db6 to pyrekordbox.masterdb and requires
+    # Python 3.11+, so which branch runs depends on the interpreter: Windows builds
+    # on Python 3.9 stay on 0.4.x. See requirements.txt for the supported range.
+    try:
+        from pyrekordbox.masterdb import MasterDatabase
+        from pyrekordbox.masterdb.models import DjmdContent
+    except ModuleNotFoundError as _e:
+        if _e.name != "pyrekordbox.masterdb":
+            raise
+        from pyrekordbox import Rekordbox6Database as MasterDatabase
+        from pyrekordbox.db6.tables import DjmdContent
     PYREKORDBOX_AVAILABLE = True
 except Exception as _e:
     PYREKORDBOX_AVAILABLE = False
-    _IMPORT_ERROR = str(_e)
+    _IMPORT_ERROR = f"{type(_e).__name__}: {_e}"
 
 
 # Attribute values from pyrekordbox PlaylistType enum
@@ -69,10 +79,12 @@ class TrackInfo:
 class RekordboxReader:
     def __init__(self, db_path: Optional[str] = None):
         if not PYREKORDBOX_AVAILABLE:
+            hint = "" if getattr(sys, "frozen", False) else (
+                "\n\nTry: pip install -r requirements.txt"
+            )
             raise RuntimeError(
-                f"pyrekordbox could not be imported.\n\n"
-                f"Error: {_IMPORT_ERROR}\n\n"
-                f"Try: pip install pyrekordbox sqlcipher3-wheels"
+                f"The Rekordbox reader (pyrekordbox) could not be loaded.\n\n"
+                f"Error: {_IMPORT_ERROR}{hint}"
             )
         self._db = MasterDatabase(path=db_path) if db_path else MasterDatabase()
 
@@ -147,7 +159,6 @@ class RekordboxReader:
             if content is None:
                 try:
                     import sqlalchemy
-                    from pyrekordbox.db6.tables import DjmdContent
                     content = self._db.query(DjmdContent).filter(
                         sqlalchemy.func.lower(DjmdContent.FolderPath)
                         == location.lower()
@@ -175,7 +186,7 @@ class RekordboxReader:
         """Return ordered list of TrackInfo for all tracks in a playlist."""
         import os
         result = self._db.get_playlist(ID=playlist_id)
-        # pyrekordbox 0.4.4 returns the object directly when a filter arg is given
+        # pyrekordbox 0.4.4 and 0.5.0 both return the object directly when ID= is given
         if hasattr(result, "one_or_none"):
             pl = result.one_or_none()
         else:
